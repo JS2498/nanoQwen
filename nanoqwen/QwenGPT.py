@@ -392,8 +392,8 @@ print(f"\nTotal parameters: {total_params:,}")
 
 model.eval()
 # model.to('cuda')
-num_return_sequences = 3
-max_length = 300
+num_return_sequences = 1
+max_length = 500
 
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 

@@ -1,0 +1,25 @@
+[project]
+name = "nanoqwen"
+version = "0.1.0"
+description = "Minimal Qwen3-0.6B PyTorch reimplementation with HF weight loading"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch",
+  "transformers",
+  "accelerate",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+]
+
+[build-system]
+requires = ["hatchling>=1.24.0"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
