@@ -1,5 +1,7 @@
 import argparse
 import time
+from pathlib import Path
+import math
 
 import torch
 
@@ -7,10 +9,52 @@ from nanoqwen.data import HFTokenDataModule
 from nanoqwen.qwen3 import Qwen, QwenConfig
 
 
+def count_parameters(model: torch.nn.Module) -> tuple[int, int]:
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+
 def build_lr(step: int, max_steps: int, base_lr: float, warmup_steps: int) -> float:
     if warmup_steps > 0 and step < warmup_steps:
         return base_lr * float(step + 1) / float(warmup_steps)
     return base_lr
+
+
+def save_checkpoint(
+    ckpt_path: Path,
+    model: Qwen,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    args: argparse.Namespace,
+) -> None:
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "step": step,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "args": vars(args),
+        },
+        ckpt_path,
+    )
+
+
+def load_checkpoint(
+    ckpt_path: Path,
+    model: Qwen,
+    optimizer: torch.optim.Optimizer,
+    device: str,
+) -> int:
+    try:
+        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=True)
+    except TypeError:
+        # Older PyTorch versions do not support weights_only yet.
+        checkpoint = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    # resume from next step
+    return int(checkpoint["step"]) + 1
 
 
 def generate_text(
@@ -55,9 +99,38 @@ def generate_text(
     return dm.decode(x[0].tolist())
 
 
+@torch.no_grad()
+def estimate_val_loss(
+    model: Qwen,
+    dm: HFTokenDataModule,
+    batch_size: int,
+    block_size: int,
+    eval_iters: int,
+    device: str,
+    use_amp: bool,
+) -> tuple[float, float]:
+    model.eval()
+    losses = []
+    for _ in range(eval_iters):
+        xb, yb = dm.get_batch("val", batch_size, block_size, device=device)
+        if device == "cuda" and use_amp:
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                _, loss = model(xb, yb)
+        else:
+            _, loss = model(xb, yb)
+        losses.append(loss.item())
+
+    mean_loss = float(sum(losses) / max(len(losses), 1))
+    ppl = float(math.exp(mean_loss)) if mean_loss < 20 else float("inf")
+    model.train()
+    return mean_loss, ppl
+
+
 def train(args: argparse.Namespace) -> None:
     if args.log_interval <= 0:
         raise ValueError("log_interval must be > 0")
+    if args.save_interval <= 0:
+        raise ValueError("save_interval must be > 0")
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -86,8 +159,15 @@ def train(args: argparse.Namespace) -> None:
         head_dim=args.head_dim,
     )
     model = Qwen(config).to(device)
-    model = torch.compile(model)
+    if args.use_compile:
+        model = torch.compile(model)
     model.train()
+    total_params, trainable_params = count_parameters(model)
+    print(
+        "model_params: "
+        f"total={total_params:,} ({total_params/1e6:.2f}M) | "
+        f"trainable={trainable_params:,} ({trainable_params/1e6:.2f}M)"
+    )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -104,6 +184,8 @@ def train(args: argparse.Namespace) -> None:
             wandb_run = wandb.init(
                 project=args.wandb_project,
                 name=args.wandb_run_name,
+                id=args.wandb_run_id,
+                resume=args.wandb_resume,
                 config=vars(args),
             )
         except Exception as e:
@@ -111,8 +193,16 @@ def train(args: argparse.Namespace) -> None:
             wandb_run = None
 
     step_digits = len(str(args.max_steps))
+    start_step = 0
 
-    for step in range(args.max_steps):
+    if args.resume_from is not None:
+        resume_path = Path(args.resume_from)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
+        start_step = load_checkpoint(resume_path, model, optimizer, device)
+        print(f"resumed_from: {resume_path} | start_step: {start_step}")
+
+    for step in range(start_step, args.max_steps):
         t0 = time.perf_counter()
 
         lr = build_lr(step, args.max_steps, args.learning_rate, args.warmup_steps)
@@ -123,7 +213,10 @@ def train(args: argparse.Namespace) -> None:
 
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
+        if device == "cuda" and args.use_amp:
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                _, loss = model(xb, yb)
+        else:
             _, loss = model(xb, yb)
         loss.backward()
         optimizer.step()
@@ -148,14 +241,36 @@ def train(args: argparse.Namespace) -> None:
 
         step_str = f"{step:0{step_digits}d}/{args.max_steps:0{step_digits}d}"
         if (step % args.log_interval == 0) or (step == args.max_steps - 1):
+            val_loss, val_ppl = estimate_val_loss(
+                model=model,
+                dm=dm,
+                batch_size=args.batch_size,
+                block_size=args.block_size,
+                eval_iters=args.eval_iters,
+                device=device,
+                use_amp=args.use_amp,
+            )
             print(
                 f"step: {step_str:<{(step_digits * 2) + 1}} | "
                 f"loss: {loss.item():>9.6f} | "
+                f"val_loss: {val_loss:>9.6f} | "
                 f"lr: {lr:>8.2e} | "
                 f"time: {dt_ms:>6.2f}ms | "
                 f"tokens_per_sec: {tok_per_sec:>9.2f}"
             )
-        
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "val/loss": val_loss,
+                        "val/perplexity": val_ppl,
+                    },
+                    step=global_step,
+                )
+        if ((step + 1) % args.save_interval == 0) or (step == args.max_steps - 1):
+            ckpt_file = Path(args.checkpoint_dir) / f"step_{step+1:06d}.pt"
+            save_checkpoint(ckpt_file, model, optimizer, step, args)
+            if wandb_run is not None:
+                wandb_run.log({"checkpoint/step": step + 1}, step=global_step)
 
     generated = generate_text(
         model=model,
@@ -186,6 +301,10 @@ if __name__ == "__main__":
     parser.add_argument("--block-size", type=int, default=32)
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--log-interval", type=int, default=20)
+    parser.add_argument("--eval-iters", type=int, default=20)
+    parser.add_argument("--save-interval", type=int, default=2500)
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    parser.add_argument("--resume-from", type=str, default=None)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--warmup-steps", type=int, default=20)
     parser.add_argument("--gen-prompt", type=str, default="Hello from nanoQwen")
@@ -194,15 +313,25 @@ if __name__ == "__main__":
     parser.add_argument("--gen-temperature", type=float, default=1.0)
 
     parser.add_argument("--n-head", type=int, default=4)
-    parser.add_argument("--n-layer", type=int, default=4)
+    parser.add_argument("--n-layer", type=int, default=8)
     parser.add_argument("--n-kv-head", type=int, default=2)
     parser.add_argument("--head-dim", type=int, default=64)
     parser.add_argument("--hidden-size", type=int, default=256)
 
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--use-compile", action="store_true")
+    parser.add_argument("--use-amp", action="store_true")  # for mixed precision training on CUDA (autocast)
+    
     parser.add_argument("--use-wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="nanoqwen")
     parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument("--wandb-run-id", type=str, default=None)
+    parser.add_argument(
+        "--wandb-resume",
+        type=str,
+        default="allow",
+        choices=["allow", "must", "never", "auto"],
+    )
     args = parser.parse_args()
     train(args)
 
