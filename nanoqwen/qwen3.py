@@ -10,9 +10,9 @@ from transformers import AutoModelForCausalLM
 
 @dataclass
 class QwenConfig:
-    block_size: int = 1024
+    max_position_embeddings: int = 1024
     vocab_size: int = 151936
-    n_embed: int = 1024
+    hidden_size: int = 1024
     n_head: int = 16
     n_layer: int = 28
     n_kv_head: int = 8
@@ -57,10 +57,10 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_kv_head > 0 and config.n_head % config.n_kv_head == 0
 
-        self.q_proj = nn.Linear(config.n_embed, config.n_head * config.head_dim, bias=False)
-        self.k_proj = nn.Linear(config.n_embed, config.n_kv_head * config.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.n_embed, config.n_kv_head * config.head_dim, bias=False)
-        self.o_proj = nn.Linear(config.n_head * config.head_dim, config.n_embed, bias=False)
+        self.q_proj = nn.Linear(config.hidden_size, config.n_head * config.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, config.n_kv_head * config.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, config.n_kv_head * config.head_dim, bias=False)
+        self.o_proj = nn.Linear(config.n_head * config.head_dim, config.hidden_size, bias=False)
 
         self.q_norm = Qwen3RMSNorm(config.head_dim)
         self.k_norm = Qwen3RMSNorm(config.head_dim)
@@ -72,13 +72,13 @@ class CausalSelfAttention(nn.Module):
 
         self.register_buffer(
             "mask",
-            torch.tril(torch.ones(config.block_size, config.block_size)).view(
-                1, 1, config.block_size, config.block_size
+            torch.tril(torch.ones(config.max_position_embeddings, config.max_position_embeddings)).view(
+                1, 1, config.max_position_embeddings, config.max_position_embeddings
             ),
             persistent=False,
         )
 
-        cos, sin = precompute_rope_cache(config.block_size, config.head_dim, config.rope_theta)
+        cos, sin = precompute_rope_cache(config.max_position_embeddings, config.head_dim, config.rope_theta)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
@@ -114,10 +114,10 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config: QwenConfig) -> None:
         super().__init__()
-        hidden = 3 * config.n_embed
-        self.gate_proj = nn.Linear(config.n_embed, hidden, bias=False)
-        self.up_proj = nn.Linear(config.n_embed, hidden, bias=False)
-        self.down_proj = nn.Linear(hidden, config.n_embed, bias=False)
+        hidden = 3 * config.hidden_size
+        self.gate_proj = nn.Linear(config.hidden_size, hidden, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, hidden, bias=False)
+        self.down_proj = nn.Linear(hidden, config.hidden_size, bias=False)
         self.silu = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -129,8 +129,8 @@ class Block(nn.Module):
         super().__init__()
         self.self_attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
-        self.input_layernorm = Qwen3RMSNorm(config.n_embed)
-        self.post_attention_layernorm = Qwen3RMSNorm(config.n_embed)
+        self.input_layernorm = Qwen3RMSNorm(config.hidden_size)
+        self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.self_attn(self.input_layernorm(x))
@@ -144,18 +144,20 @@ class Qwen(nn.Module):
         self.config = config
         self.model = nn.ModuleDict(
             {
-                "embed_tokens": nn.Embedding(config.vocab_size, config.n_embed),
+                "embed_tokens": nn.Embedding(config.vocab_size, config.hidden_size),
                 "layers": nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-                "norm": Qwen3RMSNorm(config.n_embed),
+                "norm": Qwen3RMSNorm(config.hidden_size),
             }
         )
-        self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.model.embed_tokens.weight = self.lm_head.weight
 
     def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None):
         bsz, seqlen = idx.size()
-        if seqlen > self.config.block_size:
-            raise ValueError(f"Sequence length {seqlen} exceeds block size {self.config.block_size}")
+        if seqlen > self.config.max_position_embeddings:
+            raise ValueError(
+                f"Sequence length {seqlen} exceeds max_position_embeddings {self.config.max_position_embeddings}"
+            )
 
         x = self.model.embed_tokens(idx)
         for block in self.model["layers"]:
@@ -169,11 +171,11 @@ class Qwen(nn.Module):
         return logits, loss
 
     @classmethod
-    def from_pretrained(cls, model_name: str = "Qwen/Qwen3-0.6B", block_size: int = 1024):
+    def from_pretrained(cls, model_name: str = "Qwen/Qwen3-0.6B", max_position_embeddings: int = 1024):
         if model_name != "Qwen/Qwen3-0.6B":
             raise ValueError("Only Qwen/Qwen3-0.6B is supported in this implementation")
 
-        config = QwenConfig(block_size=block_size)
+        config = QwenConfig(max_position_embeddings=max_position_embeddings)
         model = cls(config)
 
         model_hf = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="auto")

@@ -25,11 +25,19 @@ def generate_text(
 ) -> str:
     model.eval()
     generator = torch.Generator(device=device).manual_seed(seed)
-    x = torch.tensor([dm.encode(prompt)], dtype=torch.long, device=device)
+    prompt_ids = dm.encode(prompt)
+    max_ctx = model.config.max_position_embeddings
+    if len(prompt_ids) == 0:
+        raise ValueError("gen_prompt tokenized to an empty sequence")
+
+    # Keep only the last max_ctx tokens if prompt is longer than context window.
+    x = torch.tensor([prompt_ids[-max_ctx:]], dtype=torch.long, device=device)
 
     for _ in range(max_new_tokens):
         with torch.no_grad():
-            logits, _ = model(x)
+            # Rolling context window for autoregressive decoding.
+            x_cond = x[:, -max_ctx:]
+            logits, _ = model(x_cond)
             next_logits = logits[:, -1, :]
 
             if temperature <= 0:
@@ -71,15 +79,36 @@ def train(args: argparse.Namespace) -> None:
     config = QwenConfig(
         max_position_embeddings=args.block_size,
         vocab_size=dm.vocab_size,
+        hidden_size=args.hidden_size,
         n_head=args.n_head,
         n_layer=args.n_layer,
         n_kv_head=args.n_kv_head,
         head_dim=args.head_dim,
     )
     model = Qwen(config).to(device)
+    model = torch.compile(model)
     model.train()
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, betas=(0.9, 0.95), eps=1e-8)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.learning_rate,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        foreach=False,
+    )
+    wandb_run = None
+    if args.use_wandb:
+        try:
+            import wandb  # type: ignore
+
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                config=vars(args),
+            )
+        except Exception as e:
+            print(f"wandb disabled: {e}")
+            wandb_run = None
 
     step_digits = len(str(args.max_steps))
 
@@ -93,13 +122,29 @@ def train(args: argparse.Namespace) -> None:
         xb, yb = dm.get_batch("train", args.batch_size, args.block_size, device=device)
 
         optimizer.zero_grad(set_to_none=True)
-        _, loss = model(xb, yb)
+
+        with torch.autocast(device_type='cuda', dtype=torch.float16):
+            _, loss = model(xb, yb)
         loss.backward()
         optimizer.step()
 
-        dt = time.perf_counter() - t0
+        dt = (time.perf_counter() - t0)
+        dt_ms = dt * 1000
         tokens = args.batch_size * args.block_size
         tok_per_sec = tokens / max(dt, 1e-9)
+        global_step = step + 1
+
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "step": step,
+                    "global_step": global_step,
+                    "train/loss": loss.item(),
+                    "train/lr": lr,
+                    "train/tokens_per_sec": tok_per_sec,
+                },
+                step=global_step,
+            )
 
         step_str = f"{step:0{step_digits}d}/{args.max_steps:0{step_digits}d}"
         if (step % args.log_interval == 0) or (step == args.max_steps - 1):
@@ -107,8 +152,10 @@ def train(args: argparse.Namespace) -> None:
                 f"step: {step_str:<{(step_digits * 2) + 1}} | "
                 f"loss: {loss.item():>9.6f} | "
                 f"lr: {lr:>8.2e} | "
+                f"time: {dt_ms:>6.2f}ms | "
                 f"tokens_per_sec: {tok_per_sec:>9.2f}"
             )
+        
 
     generated = generate_text(
         model=model,
@@ -122,6 +169,9 @@ def train(args: argparse.Namespace) -> None:
     )
     print("\n=== Generated Text ===")
     print(generated)
+    if wandb_run is not None:
+        wandb_run.log({"generation/text": generated}, step=args.max_steps)
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
@@ -132,8 +182,8 @@ if __name__ == "__main__":
     parser.add_argument("--train-split", type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=1337)
 
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--block-size", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--block-size", type=int, default=32)
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--log-interval", type=int, default=20)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
@@ -143,12 +193,16 @@ if __name__ == "__main__":
     parser.add_argument("--gen-top-k", type=int, default=50)
     parser.add_argument("--gen-temperature", type=float, default=1.0)
 
-    parser.add_argument("--n-head", type=int, default=8)
-    parser.add_argument("--n-layer", type=int, default=8)
-    parser.add_argument("--n-kv-head", type=int, default=4)
+    parser.add_argument("--n-head", type=int, default=4)
+    parser.add_argument("--n-layer", type=int, default=4)
+    parser.add_argument("--n-kv-head", type=int, default=2)
     parser.add_argument("--head-dim", type=int, default=64)
+    parser.add_argument("--hidden-size", type=int, default=256)
 
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--use-wandb", action="store_true")
+    parser.add_argument("--wandb-project", type=str, default="nanoqwen")
+    parser.add_argument("--wandb-run-name", type=str, default=None)
     args = parser.parse_args()
     train(args)
 
