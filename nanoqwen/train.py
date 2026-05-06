@@ -252,7 +252,7 @@ def train(args: argparse.Namespace) -> None:
             )
             print(
                 f"step: {step_str:<{(step_digits * 2) + 1}} | "
-                f"loss: {loss.item():>9.6f} | "
+                f"train_loss: {loss.item():>9.6f} | "
                 f"val_loss: {val_loss:>9.6f} | "
                 f"lr: {lr:>8.2e} | "
                 f"time: {dt_ms:>6.2f}ms | "
@@ -301,8 +301,8 @@ if __name__ == "__main__":
     parser.add_argument("--block-size", type=int, default=32)
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--log-interval", type=int, default=20)
-    parser.add_argument("--eval-iters", type=int, default=20)
-    parser.add_argument("--save-interval", type=int, default=2500)
+    parser.add_argument("--eval-iters", type=int, default=200)
+    parser.add_argument("--save-interval", type=int, default=500)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--resume-from", type=str, default=None)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
@@ -338,8 +338,6 @@ if __name__ == "__main__":
 
 # Things to do from Tuesday (Check Obsidian notes for more details):
 # 1. Train it on some useful dataset
-# 2. Evaluation at certain intervals during training
 # 3. Blog with your own writeup and analysis of the training process and results
-# 4. Saving the checkpoint and retraining from it, and sharing the checkpoint for others to load and use
 # 5. Implement SFT and evaluate the model
 # 6. Include the RLHF training loop and evaluate the model after RLHF training as well
