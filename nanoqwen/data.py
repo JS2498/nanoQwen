@@ -13,6 +13,7 @@ class HFTokenDataModule:
         model_name: str = "Qwen/Qwen3-0.6B",
         data_dir: str = "data",
         file_name: str = "input.txt",
+        val_file_name: str | None = None,
         train_split: float = 0.9,
         seed: int = 1337,
     ) -> None:
@@ -22,28 +23,49 @@ class HFTokenDataModule:
         self.data_path = Path(data_dir) / file_name
         if not self.data_path.exists():
             raise FileNotFoundError(f"Data file not found: {self.data_path}")
+        self.val_data_path = Path(data_dir) / val_file_name if val_file_name else None
+        if self.val_data_path is not None and not self.val_data_path.exists():
+            raise FileNotFoundError(f"Validation data file not found: {self.val_data_path}")
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.vocab_size = self.tokenizer.vocab_size
         self.train_split = train_split
 
-        text = self.data_path.read_text(encoding="utf-8")
-        # We tokenize the full corpus once and later train on short blocks from it.
-        # Disable tokenizer verbosity to avoid misleading max-length warnings here.
-        enc = self.tokenizer(
-            text,
-            return_tensors="pt",
-            add_special_tokens=False,
-            verbose=False,
-        )
-        self.tokens = enc.input_ids.squeeze(0).to(torch.long)
+        if self.val_data_path is not None:
+            train_text = self.data_path.read_text(encoding="utf-8")
+            val_text = self.val_data_path.read_text(encoding="utf-8")
+            train_enc = self.tokenizer(
+                train_text,
+                return_tensors="pt",
+                add_special_tokens=False,
+                verbose=False,
+            )
+            val_enc = self.tokenizer(
+                val_text,
+                return_tensors="pt",
+                add_special_tokens=False,
+                verbose=False,
+            )
+            self.train_data = train_enc.input_ids.squeeze(0).to(torch.long)
+            self.val_data = val_enc.input_ids.squeeze(0).to(torch.long)
+        else:
+            text = self.data_path.read_text(encoding="utf-8")
+            # We tokenize the full corpus once and later train on short blocks from it.
+            # Disable tokenizer verbosity to avoid misleading max-length warnings here.
+            enc = self.tokenizer(
+                text,
+                return_tensors="pt",
+                add_special_tokens=False,
+                verbose=False,
+            )
+            self.tokens = enc.input_ids.squeeze(0).to(torch.long)
 
-        if self.tokens.numel() < 2:
-            raise ValueError("Dataset must tokenize to at least 2 tokens")
+            if self.tokens.numel() < 2:
+                raise ValueError("Dataset must tokenize to at least 2 tokens")
 
-        n = int(self.tokens.numel() * self.train_split)
-        self.train_data = self.tokens[:n]
-        self.val_data = self.tokens[n:]
+            n = int(self.tokens.numel() * self.train_split)
+            self.train_data = self.tokens[:n]
+            self.val_data = self.tokens[n:]
 
         if self.train_data.numel() < 2 or self.val_data.numel() < 2:
             raise ValueError("Train/val split too small after tokenization")

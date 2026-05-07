@@ -15,10 +15,29 @@ def count_parameters(model: torch.nn.Module) -> tuple[int, int]:
     return total, trainable
 
 
-def build_lr(step: int, max_steps: int, base_lr: float, warmup_steps: int) -> float:
+def build_lr(
+    step: int,
+    max_steps: int,
+    base_lr: float,
+    warmup_steps: int,
+    scheduler: str,
+    min_lr_ratio: float,
+) -> float:
+    # Linear warmup: 0 -> base_lr
     if warmup_steps > 0 and step < warmup_steps:
         return base_lr * float(step + 1) / float(warmup_steps)
-    return base_lr
+
+    if scheduler == "constant":
+        return base_lr
+
+    # Cosine decay after warmup: base_lr -> min_lr
+    min_lr = base_lr * min_lr_ratio
+    if max_steps <= warmup_steps:
+        return min_lr
+    decay_steps = max_steps - warmup_steps
+    decay_progress = min(max(step - warmup_steps, 0) / max(decay_steps, 1), 1.0)
+    cosine_coeff = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+    return min_lr + (base_lr - min_lr) * cosine_coeff
 
 
 def save_checkpoint(
@@ -144,7 +163,8 @@ def train(args: argparse.Namespace) -> None:
     dm = HFTokenDataModule(
         model_name=args.model_name,
         data_dir=args.data_dir,
-        file_name=args.file_name,
+        file_name=args.train_file_name,
+        val_file_name=args.val_file_name,
         train_split=args.train_split,
         seed=args.seed,
     )
@@ -205,7 +225,14 @@ def train(args: argparse.Namespace) -> None:
     for step in range(start_step, args.max_steps):
         t0 = time.perf_counter()
 
-        lr = build_lr(step, args.max_steps, args.learning_rate, args.warmup_steps)
+        lr = build_lr(
+            step=step,
+            max_steps=args.max_steps,
+            base_lr=args.learning_rate,
+            warmup_steps=args.warmup_steps,
+            scheduler=args.lr_scheduler,
+            min_lr_ratio=args.min_lr_ratio,
+        )
         for g in optimizer.param_groups:
             g["lr"] = lr
 
@@ -293,7 +320,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train nanoQwen from scratch on a local text file")
     parser.add_argument("--model-name", type=str, default="Qwen/Qwen3-0.6B", help="HF model name for tokenizer")
     parser.add_argument("--data-dir", type=str, default="data")
-    parser.add_argument("--file-name", type=str, default="input.txt")
+    parser.add_argument("--file-name", type=str, default=None, help="Deprecated alias for --train-file-name")
+    parser.add_argument("--train-file-name", type=str, default="input.txt")
+    parser.add_argument("--val-file-name", type=str, default=None)
     parser.add_argument("--train-split", type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=1337)
 
@@ -302,11 +331,13 @@ if __name__ == "__main__":
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--log-interval", type=int, default=20)
     parser.add_argument("--eval-iters", type=int, default=200)
-    parser.add_argument("--save-interval", type=int, default=500)
+    parser.add_argument("--save-interval", type=int, default=2000)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--resume-from", type=str, default=None)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--warmup-steps", type=int, default=20)
+    parser.add_argument("--lr-scheduler", type=str, default="cosine", choices=["constant", "cosine"])
+    parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--gen-prompt", type=str, default="Hello from nanoQwen")
     parser.add_argument("--gen-max-new-tokens", type=int, default=80)
     parser.add_argument("--gen-top-k", type=int, default=50)
@@ -333,11 +364,12 @@ if __name__ == "__main__":
         choices=["allow", "must", "never", "auto"],
     )
     args = parser.parse_args()
+    if args.file_name is not None:
+        args.train_file_name = args.file_name
     train(args)
 
 
 # Things to do from Tuesday (Check Obsidian notes for more details):
-# 1. Train it on some useful dataset
 # 3. Blog with your own writeup and analysis of the training process and results
 # 5. Implement SFT and evaluate the model
 # 6. Include the RLHF training loop and evaluate the model after RLHF training as well
