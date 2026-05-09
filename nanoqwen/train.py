@@ -167,6 +167,8 @@ def train(args: argparse.Namespace) -> None:
         val_file_name=args.val_file_name,
         train_split=args.train_split,
         seed=args.seed,
+        token_cache_dir=args.token_cache_dir,
+        rebuild_token_cache=args.rebuild_token_cache,
     )
 
     config = QwenConfig(
@@ -323,6 +325,8 @@ if __name__ == "__main__":
     parser.add_argument("--file-name", type=str, default=None, help="Deprecated alias for --train-file-name")
     parser.add_argument("--train-file-name", type=str, default="input.txt")
     parser.add_argument("--val-file-name", type=str, default=None)
+    parser.add_argument("--token-cache-dir", type=str, default="data/cache")
+    parser.add_argument("--rebuild-token-cache", action="store_true")
     parser.add_argument("--train-split", type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=1337)
 
