@@ -1,88 +1,117 @@
 # nanoQwen
 
-## What this repo does
-This repo is a from-scratch PyTorch implementation of a Qwen-style decoder model and training workflow.
-It includes:
-- model implementation (`RMSNorm`, `RoPE`, `GQA`, gated MLP)
-- loading Hugging Face Qwen weights for parity checks
-- local training on `data/input.txt` (Tiny Shakespeare)
-- generation and HF-vs-local comparison CLIs
+Minimal Qwen-style LLM project in PyTorch with:
+- decoder-only model implementation
+- HF weight loading + parity checks
+- pretraining loop
+- SFT data pipeline + SFT training loop
+- checkpointing/resume/generation workflows
 
-## What is implemented
-- Qwen-style model in `nanoqwen/qwen3.py`
-- HF weight loading for `Qwen/Qwen3-0.6B`
-- Parity script for logits and token generation comparison
-- Training loop with:
-  - AdamW
-  - warmup LR
-  - optional `torch.compile`
-  - optional AMP (`autocast`)
-  - periodic validation loss/perplexity
-  - periodic checkpoint save
-  - resume from checkpoint
-  - optional Weights & Biases logging
-- Post-training text generation
+## Implemented
+- `nanoqwen/qwen3.py`
+  - Qwen-style architecture (`RoPE`, `RMSNorm`, `GQA`, gated MLP)
+  - weight tying (`embed_tokens` and `lm_head`)
+  - HF load path for `Qwen/Qwen3-0.6B`
+- `nanoqwen/data.py`
+  - pretraining token cache + memmap batches
+- `nanoqwen/train.py`
+  - pretraining loop with AdamW, warmup + cosine/constant LR, val loss/perplexity
+  - checkpoint save/load, resume, generation
+  - optional `torch.compile`, optional AMP, optional W&B
+- `nanoqwen/sft_data.py`
+  - JSONL SFT ingestion (`prompt`/`response`)
+  - label masking (`ignore_index=-100`) + next-token alignment
+  - memmap cache for train/val
+- `nanoqwen/train_sft.py`
+  - SFT loop with val loss, LR schedule, optional compile/AMP
+  - load pretrained checkpoint (including vocab-size/compile-prefix compatibility)
+- `nanoqwen/compare_hf.py`
+  - local vs HF logits/token comparison
+- `scripts/download_dataset.py`
+  - generic plain-text dataset download (`train`/`validation`/`both`)
+- `scripts/download_sftdata.py`
+  - SFT JSONL dataset download/split
+- `scripts/sft_length_stats.py`
+  - tokenized length stats for choosing sequence length
 
-## Repository structure
-- `nanoqwen/qwen3.py`: model + HF loading
-- `nanoqwen/data.py`: tokenizer-based dataset + batch sampling
-- `nanoqwen/train.py`: train/eval/checkpoint/resume/W&B CLI
-- `nanoqwen/generate.py`: generation CLI
-- `nanoqwen/compare_hf.py`: local vs HF parity CLI
-- `data/input.txt`: Tiny Shakespeare dataset
-- `misc/`: GPT-2 implementation and feature experiments inspired by Karpathy's nanoGPT walkthrough
+## Repo layout
+- `nanoqwen/`: model + training + data pipeline code
+- `scripts/`: dataset prep scripts
+- `data/`: local datasets and caches
+- `docs/`: sample outputs and notes
+- `misc/`: GPT-2 code and experiments from Karpathy nanoGPT-style learning
 
 ## Setup
-Create local env:
 ```bash
 uv venv
 source .venv/bin/activate
 uv pip install -e .[dev]
 ```
 
-## Available CLIs
+## Main commands
 
-### 1) Train
+### 1) Download pretraining data (TinyStories)
 ```bash
-python -m nanoqwen.train \
-  --file-name input.txt \
-  --device cuda \
-  --max-steps 500 \
-  --log-interval 20 \
-  --eval-iters 20 \
-  --save-interval 100 \
-  --checkpoint-dir checkpoints
+python scripts/download_dataset.py \
+  --dataset roneneldan/TinyStories \
+  --split both \
+  --text-field text \
+  --out data/tinystories
 ```
 
-Resume from checkpoint:
+### 2) Pretrain
 ```bash
 python -m nanoqwen.train \
-  --file-name input.txt \
+  --train-file-name tinystories_train.txt \
+  --val-file-name tinystories_val.txt \
   --device cuda \
-  --resume-from checkpoints/step_000500.pt \
-  --max-steps 1000
-```
-
-With W&B:
-```bash
-python -m nanoqwen.train \
-  --file-name input.txt \
-  --device cuda \
+  --max-steps 5000 \
+  --block-size 360 \
+  --use-compile \
   --use-wandb \
   --wandb-project nanoqwen \
-  --wandb-run-name tinyshakespeare-baseline
+  --wandb-run-name tinystories-pretrain
 ```
 
-### 2) Generate
+### 3) Download SFT data (Dahoas/sft-static)
 ```bash
-python -m nanoqwen.generate \
-  --prompt "Explain grouped-query attention" \
-  --max-new-tokens 120 \
-  --top-k 50 \
-  --temperature 0.9
+python scripts/download_sftdata.py \
+  --dataset Dahoas/sft-static \
+  --split both \
+  --prompt-field prompt \
+  --response-field response \
+  --out data/sft_static
 ```
 
-### 3) Compare local model vs HF
+### 4) SFT from pretrained checkpoint
+```bash
+python -m nanoqwen.train_sft \
+  --data-dir data \
+  --sft-train-file sft_static_train.jsonl \
+  --sft-val-file sft_static_val.jsonl \
+  --pretrained-ckpt checkpoints/pretrain_tinystories_step5000.pt \
+  --device cuda \
+  --use-compile \
+  --batch-size 2 \
+  --block-size 256 \
+  --max-steps 5000
+```
+
+### 5) Generate from checkpoint
+```bash
+python -m nanoqwen.train \
+  --train-file-name tinystories_train.txt \
+  --val-file-name tinystories_val.txt \
+  --device cuda \
+  --max-steps 0 \
+  --resume-from checkpoints/sft_dahoas_step5000.pt \
+  --gen-prompt $'Human: Explain gravity in simple terms.\n\nAssistant:' \
+  --gen-max-new-tokens 200 \
+  --gen-temperature 0.0 \
+  --gen-top-k 1
+```
+
+### 6) HF parity check
 ```bash
 python -m nanoqwen.compare_hf \
   --prompt "Hello from Qwen" \
@@ -93,3 +122,15 @@ python -m nanoqwen.compare_hf \
   --device-mode cpu \
   --hf-dtype float32
 ```
+
+## Performance snapshot
+Hardware used: NVIDIA GeForce GTX 1650 Ti (~4GB VRAM), CUDA 12.2.
+
+| Mode | Avg step time (ms) | Avg tokens/sec |
+|---|---:|---:|
+| Baseline | ~43.0 | ~1536 |
+| `--use-compile` | ~19.2 | ~3251 |
+| `--use-amp` | ~60.3 | ~1064 |
+| `--use-compile --use-amp` | ~46.8 | ~1366 |
+
+On this setup, `torch.compile` gave the best throughput.

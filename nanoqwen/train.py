@@ -48,10 +48,11 @@ def save_checkpoint(
     args: argparse.Namespace,
 ) -> None:
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    model_state = model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict()
     torch.save(
         {
             "step": step,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": model_state,
             "optimizer_state_dict": optimizer.state_dict(),
             "args": vars(args),
         },
@@ -70,7 +71,45 @@ def load_checkpoint(
     except TypeError:
         # Older PyTorch versions do not support weights_only yet.
         checkpoint = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model_state = checkpoint["model_state_dict"]
+    model_keys = list(model.state_dict().keys())
+    ckpt_keys = list(model_state.keys())
+    model_has_orig = any(k.startswith("_orig_mod.") for k in model_keys)
+    ckpt_has_orig = any(k.startswith("_orig_mod.") for k in ckpt_keys)
+
+    # Normalize compile prefix mismatch in either direction.
+    if ckpt_has_orig and not model_has_orig:
+        model_state = {k.replace("_orig_mod.", "", 1): v for k, v in model_state.items()}
+    elif model_has_orig and not ckpt_has_orig:
+        model_state = {f"_orig_mod.{k}": v for k, v in model_state.items()}
+
+    current_state = model.state_dict()
+    resize_keys = ["model.embed_tokens.weight", "lm_head.weight"]
+    for k in resize_keys:
+        ck = f"_orig_mod.{k}" if f"_orig_mod.{k}" in model_state else k
+        mk = f"_orig_mod.{k}" if f"_orig_mod.{k}" in current_state else k
+        if ck not in model_state or mk not in current_state:
+            continue
+
+        src = model_state[ck]
+        dst = current_state[mk]
+        if src.shape == dst.shape:
+            continue
+
+        if src.ndim != 2 or dst.ndim != 2 or src.shape[1] != dst.shape[1] or src.shape[0] > dst.shape[0]:
+            raise RuntimeError(
+                f"Unsupported shape mismatch for {mk}: checkpoint={tuple(src.shape)}, model={tuple(dst.shape)}"
+            )
+
+        expanded = dst.clone()
+        expanded[: src.shape[0]] = src
+        model_state[ck] = expanded
+        print(
+            f"resized_checkpoint_tensor: {mk} {tuple(src.shape)} -> {tuple(dst.shape)} "
+            f"(copied first {src.shape[0]} rows)"
+        )
+
+    model.load_state_dict(model_state)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     # resume from next step
     return int(checkpoint["step"]) + 1
@@ -331,7 +370,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=1337)
 
     parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--block-size", type=int, default=32)
+    parser.add_argument("--block-size", type=int, default=240)
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--log-interval", type=int, default=20)
     parser.add_argument("--eval-iters", type=int, default=200)

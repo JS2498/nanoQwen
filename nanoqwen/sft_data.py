@@ -82,7 +82,9 @@ class SFTMemmapDataModule:
             raise ValueError("train_split must be between 0 and 1")
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.vocab_size = self.tokenizer.vocab_size
+        # For Qwen tokenizers, valid token IDs can be >= tokenizer.vocab_size.
+        # Model embedding size must match len(tokenizer) for safe indexing.
+        self.vocab_size = len(self.tokenizer)
         self.max_seq_len = max_seq_len
         self.prompt_field = prompt_field
         self.response_field = response_field

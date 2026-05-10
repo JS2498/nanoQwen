@@ -53,7 +53,8 @@ class HFTokenDataModule:
             raise FileNotFoundError(f"Validation data file not found: {self.val_data_path}")
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.vocab_size = self.tokenizer.vocab_size
+        # Use full tokenizer length (includes added/special tokens) for safe embedding size.
+        self.vocab_size = len(self.tokenizer)
         self.train_split = train_split
 
         self.cache_dir = Path(token_cache_dir)
