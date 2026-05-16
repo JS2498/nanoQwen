@@ -4,7 +4,8 @@ import time
 from pathlib import Path
 
 import torch
-
+import wandb
+        
 from nanoqwen.qwen3 import Qwen, QwenConfig
 from nanoqwen.sft_data import SFTMemmapDataModule
 
@@ -37,6 +38,77 @@ def build_lr(
     decay_progress = min(max(step - warmup_steps, 0) / max(decay_steps, 1), 1.0)
     cosine_coeff = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
     return min_lr + (base_lr - min_lr) * cosine_coeff
+
+
+def save_checkpoint(
+    ckpt_path: Path,
+    model: Qwen,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    args: argparse.Namespace,
+) -> None:
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    model_state = model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict()
+    torch.save(
+        {
+            "step": step,
+            "model_state_dict": model_state,
+            "optimizer_state_dict": optimizer.state_dict(),
+            "args": vars(args),
+        },
+        ckpt_path,
+    )
+
+
+def load_checkpoint(
+    ckpt_path: Path,
+    model: Qwen,
+    optimizer: torch.optim.Optimizer,
+    device: str,
+) -> int:
+    try:
+        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=True)
+    except TypeError:
+        checkpoint = torch.load(ckpt_path, map_location=device)
+
+    model_state = checkpoint["model_state_dict"]
+
+    model_keys = list(model.state_dict().keys())
+    ckpt_keys = list(model_state.keys())
+    model_has_orig = any(k.startswith("_orig_mod.") for k in model_keys)
+    ckpt_has_orig = any(k.startswith("_orig_mod.") for k in ckpt_keys)
+
+    if ckpt_has_orig and not model_has_orig:
+        model_state = {k.replace("_orig_mod.", "", 1): v for k, v in model_state.items()}
+    elif model_has_orig and not ckpt_has_orig:
+        model_state = {f"_orig_mod.{k}": v for k, v in model_state.items()}
+
+    # vocab growth safety for embed/lm_head
+    current_state = model.state_dict()
+    resize_keys = ["model.embed_tokens.weight", "lm_head.weight"]
+    for k in resize_keys:
+        ck = f"_orig_mod.{k}" if f"_orig_mod.{k}" in model_state else k
+        mk = f"_orig_mod.{k}" if f"_orig_mod.{k}" in current_state else k
+        if ck not in model_state or mk not in current_state:
+            continue
+
+        src = model_state[ck]
+        dst = current_state[mk]
+        if src.shape == dst.shape:
+            continue
+
+        if src.ndim != 2 or dst.ndim != 2 or src.shape[1] != dst.shape[1] or src.shape[0] > dst.shape[0]:
+            raise RuntimeError(
+                f"Unsupported shape mismatch for {mk}: checkpoint={tuple(src.shape)}, model={tuple(dst.shape)}"
+            )
+
+        expanded = dst.clone()
+        expanded[: src.shape[0]] = src
+        model_state[ck] = expanded
+
+    model.load_state_dict(model_state)
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    return int(checkpoint["step"]) + 1
 
 
 @torch.no_grad()
@@ -115,6 +187,9 @@ def train_sft(args: argparse.Namespace) -> None:
     if args.log_interval <= 0:
         raise ValueError("log_interval must be > 0")
 
+    if args.save_interval <= 0:
+        raise ValueError("save_interval must be > 0")
+
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
@@ -148,19 +223,10 @@ def train_sft(args: argparse.Namespace) -> None:
         head_dim=args.head_dim,
     )
     model = Qwen(config).to(device)
-    maybe_load_pretrained(model, args.pretrained_ckpt, device)
 
-    if args.use_compile:
-        model = torch.compile(model)
-    model.train()
 
-    total_params, trainable_params = count_parameters(model)
-    print(
-        "model_params: "
-        f"total={total_params:,} ({total_params/1e6:.2f}M) | "
-        f"trainable={trainable_params:,} ({trainable_params/1e6:.2f}M)"
-    )
-
+    # Decide initialization path: resume SFT OR start from pretrained
+    start_step = 0
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -169,9 +235,42 @@ def train_sft(args: argparse.Namespace) -> None:
         foreach=False,
     )
 
+    if args.resume_from is not None and args.pretrained_ckpt is not None:
+        print("warning: --resume-from is set; ignoring --pretrained-ckpt")
+
+    if args.resume_from is not None:
+        resume_path = Path(args.resume_from)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        start_step = load_checkpoint(resume_path, model, optimizer, device)
+        print(f"resumed_from: {resume_path} | start_step: {start_step}")
+    else:
+        maybe_load_pretrained(model, args.pretrained_ckpt, device)
+
+    if args.use_compile:
+        model = torch.compile(model)
+
+    total_params, trainable_params = count_parameters(model)
+    print(
+        "model_params: "
+        f"total={total_params:,} ({total_params/1e6:.2f}M) | "
+        f"trainable={trainable_params:,} ({trainable_params/1e6:.2f}M)"
+    )
+    model.train()
+
+    wandb_run = None
+    if args.use_wandb:
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            id=args.wandb_run_id,
+            resume=args.wandb_resume,
+            config=vars(args),
+        )
+
     step_digits = len(str(args.max_steps))
 
-    for step in range(args.max_steps):
+    for step in range(start_step, args.max_steps):
         t0 = time.perf_counter()
 
         lr = build_lr(
@@ -222,6 +321,32 @@ def train_sft(args: argparse.Namespace) -> None:
             )
 
 
+            if args.use_wandb:
+                wandb.log(
+                    {
+                        "step": step,
+                        "train_loss": loss.item(),
+                        "val_loss": val_loss,
+                        "lr": lr,
+                        "step_time_ms": dt_ms,
+                        "tokens_per_sec": tok_per_sec,
+                        "tokens_per_step": tokens,
+                    },
+                    step=step,
+                )
+
+        if ((step + 1) % args.save_interval == 0) or (step == args.max_steps - 1):
+            ckpt_name = f"sft_step_{step + 1:06d}.pt"
+            ckpt_path = Path(args.checkpoint_dir) / ckpt_name
+            save_checkpoint(ckpt_path, model, optimizer, step, args)
+            print(f"saved_checkpoint: {ckpt_path}")
+
+            if args.use_wandb:
+                wandb.log({"checkpoint_step": step + 1}, step=step)
+    
+    if wandb_run is not None:
+        wandb_run.finish()
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SFT training loop for nanoQwen")
     parser.add_argument("--model-name", type=str, default="Qwen/Qwen3-0.6B")
@@ -258,6 +383,21 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--use-compile", action="store_true")
     parser.add_argument("--use-amp", action="store_true")
+
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    parser.add_argument("--save-interval", type=int, default=2000)
+    parser.add_argument("--resume-from", type=str, default=None)
+
+    parser.add_argument("--use-wandb", action="store_true")
+    parser.add_argument("--wandb-project", type=str, default="nanoqwen")
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument("--wandb-run-id", type=str, default=None)
+    parser.add_argument(
+        "--wandb-resume",
+        type=str,
+        default="allow",
+        choices=["allow", "must", "never", "auto"],
+    )
 
     args = parser.parse_args()
     train_sft(args)

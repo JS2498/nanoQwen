@@ -48,11 +48,10 @@ def save_checkpoint(
     args: argparse.Namespace,
 ) -> None:
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-    model_state = model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict()
     torch.save(
         {
             "step": step,
-            "model_state_dict": model_state,
+            "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "args": vars(args),
         },
@@ -71,45 +70,7 @@ def load_checkpoint(
     except TypeError:
         # Older PyTorch versions do not support weights_only yet.
         checkpoint = torch.load(ckpt_path, map_location=device)
-    model_state = checkpoint["model_state_dict"]
-    model_keys = list(model.state_dict().keys())
-    ckpt_keys = list(model_state.keys())
-    model_has_orig = any(k.startswith("_orig_mod.") for k in model_keys)
-    ckpt_has_orig = any(k.startswith("_orig_mod.") for k in ckpt_keys)
-
-    # Normalize compile prefix mismatch in either direction.
-    if ckpt_has_orig and not model_has_orig:
-        model_state = {k.replace("_orig_mod.", "", 1): v for k, v in model_state.items()}
-    elif model_has_orig and not ckpt_has_orig:
-        model_state = {f"_orig_mod.{k}": v for k, v in model_state.items()}
-
-    current_state = model.state_dict()
-    resize_keys = ["model.embed_tokens.weight", "lm_head.weight"]
-    for k in resize_keys:
-        ck = f"_orig_mod.{k}" if f"_orig_mod.{k}" in model_state else k
-        mk = f"_orig_mod.{k}" if f"_orig_mod.{k}" in current_state else k
-        if ck not in model_state or mk not in current_state:
-            continue
-
-        src = model_state[ck]
-        dst = current_state[mk]
-        if src.shape == dst.shape:
-            continue
-
-        if src.ndim != 2 or dst.ndim != 2 or src.shape[1] != dst.shape[1] or src.shape[0] > dst.shape[0]:
-            raise RuntimeError(
-                f"Unsupported shape mismatch for {mk}: checkpoint={tuple(src.shape)}, model={tuple(dst.shape)}"
-            )
-
-        expanded = dst.clone()
-        expanded[: src.shape[0]] = src
-        model_state[ck] = expanded
-        print(
-            f"resized_checkpoint_tensor: {mk} {tuple(src.shape)} -> {tuple(dst.shape)} "
-            f"(copied first {src.shape[0]} rows)"
-        )
-
-    model.load_state_dict(model_state)
+    model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     # resume from next step
     return int(checkpoint["step"]) + 1
@@ -335,7 +296,7 @@ def train(args: argparse.Namespace) -> None:
                     step=global_step,
                 )
         if ((step + 1) % args.save_interval == 0) or (step == args.max_steps - 1):
-            ckpt_file = Path(args.checkpoint_dir) / f"step_{step+1:06d}.pt"
+            ckpt_file = Path(args.checkpoint_dir) / f"train_step_{step+1:06d}.pt"
             save_checkpoint(ckpt_file, model, optimizer, step, args)
             if wandb_run is not None:
                 wandb_run.log({"checkpoint/step": step + 1}, step=global_step)
@@ -366,7 +327,7 @@ if __name__ == "__main__":
     parser.add_argument("--val-file-name", type=str, default=None)
     parser.add_argument("--token-cache-dir", type=str, default="data/cache")
     parser.add_argument("--rebuild-token-cache", action="store_true")
-    parser.add_argument("--train-split", type=float, default=0.9)
+    parser.add_argument("--train-split", type=float, default=0.9) 
     parser.add_argument("--seed", type=int, default=1337)
 
     parser.add_argument("--batch-size", type=int, default=2)
@@ -414,5 +375,4 @@ if __name__ == "__main__":
 
 # Things to do from Tuesday (Check Obsidian notes for more details):
 # 3. Blog with your own writeup and analysis of the training process and results
-# 5. Implement SFT and evaluate the model
 # 6. Include the RLHF training loop and evaluate the model after RLHF training as well
