@@ -17,6 +17,7 @@ Minimal Qwen-style LLM project in PyTorch with:
 - `nanoqwen/train.py`
   - pretraining loop with AdamW, warmup + cosine/constant LR, val loss/perplexity
   - checkpoint save/load, resume, generation
+  - optional KV-cache decoding for faster autoregressive inference
   - optional `torch.compile`, optional AMP, optional W&B
 - `nanoqwen/sft_data.py`
   - JSONL SFT ingestion (`prompt`/`response`)
@@ -111,6 +112,28 @@ python -m nanoqwen.train \
   --gen-top-k 1
 ```
 
+### 5b) Generate with KV cache
+```bash
+python -m nanoqwen.train \
+  --train-file-name tinystories_train.txt \
+  --val-file-name tinystories_val.txt \
+  --device cuda \
+  --max-steps 0 \
+  --resume-from checkpoints/sft_dahoas_100m_step15000.pt \
+  --n-layer 10 \
+  --n-head 8 \
+  --n-kv-head 4 \
+  --head-dim 64 \
+  --hidden-size 512 \
+  --block-size 256 \
+  --gen-prompt $'Human: Explain gravity in simple terms.\n\nAssistant:' \
+  --gen-max-new-tokens 200 \
+  --gen-temperature 1.0 \
+  --gen-top-k 5 \
+  --use-compile \
+  --use-kv-cache
+```
+
 ### 6) HF parity check
 ```bash
 python -m nanoqwen.compare_hf \
@@ -134,3 +157,14 @@ Hardware used: NVIDIA GeForce GTX 1650 Ti (~4GB VRAM), CUDA 12.2.
 | `--use-compile --use-amp` | ~46.8 | ~1366 |
 
 On this setup, `torch.compile` gave the best throughput.
+
+## KV cache inference snapshot
+Measured on the same hardware with the same checkpoint/prompt/sampling settings (`max_new_tokens=200`, `temperature=1.0`, `top_k=5`).
+
+| Mode | TTFT (ms) | Decode time (s) | Decode throughput (tokens/s) | Peak GPU memory (MiB) |
+|---|---:|---:|---:|---:|
+| `kv_cache_off` | 4873.41 | 28.5895 | 7.00 | 1503.60 |
+| `kv_cache_on` | 9192.01 | 12.4653 | 16.04 | 1271.27 |
+
+- Decode throughput speedup with KV cache: `16.04 / 7.00 = 2.29x`
+- In this run, TTFT increased with cache mode (likely prefill and/or compile warmup effects), but decode throughput improved significantly.

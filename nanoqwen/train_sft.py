@@ -401,3 +401,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     train_sft(args)
+
+
+# 1. Hey SFT train_loss is not a decreasing curve it just wobbles for all 15k steps

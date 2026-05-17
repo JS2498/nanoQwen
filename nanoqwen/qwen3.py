@@ -1,12 +1,15 @@
 from dataclasses import dataclass
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from transformers import AutoModelForCausalLM
 
+
+KVCache = Tuple[torch.Tensor, torch.Tensor]
+PastKeyValues = List[Optional[KVCache]]
 
 @dataclass
 class QwenConfig:
@@ -82,7 +85,11 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor,
+                past_key_values: Optional[KVCache] = None,
+                use_cache: bool = False,
+                position_offset: int = 0,
+                ) -> tuple[torch.Tensor, Optional[KVCache]]:
         bsz, seqlen, _ = x.size()
 
         q = self.q_proj(x).view(bsz, seqlen, self.n_head, self.head_dim).transpose(1, 2)
@@ -93,22 +100,64 @@ class CausalSelfAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        cos = self.cos[:, :, :seqlen, :].to(dtype=q.dtype, device=q.device)
-        sin = self.sin[:, :, :seqlen, :].to(dtype=q.dtype, device=q.device)
+        start = position_offset
+        end = position_offset + seqlen
+
+        if end > self.cos.size(2):
+            raise ValueError(
+                f"RoPE position out of range: end={end}, max={self.cos.size(2)}. "
+                "Increase max_position_embeddings or enforce cache/window trimming."
+            )
+
+        cos = self.cos[:, :, start:end, :].to(dtype=q.dtype, device=q.device)
+        sin = self.sin[:, :, start:end, :].to(dtype=q.dtype, device=q.device)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
 
-        if self.n_kv_head != self.n_head:
-            k = k.repeat_interleave(self.group_size, dim=1)
-            v = v.repeat_interleave(self.group_size, dim=1)
+        if past_key_values is not None:
+            past_k, past_v = past_key_values
+            k_cat = torch.cat([past_k, k], dim=2)
+            v_cat = torch.cat([past_v, v], dim=2)
 
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.mask[:, :, :seqlen, :seqlen] == 0, float("-inf"))
+            max_ctx = self.cos.size(2)
+            if k_cat.size(2) > max_ctx:
+                k_cat = k_cat[:, :, -max_ctx:, :].contiguous()
+                v_cat = v_cat[:, :, -max_ctx:, :].contiguous()
+        else:
+            k_cat = k
+            v_cat = v
+
+       
+        if self.n_kv_head != self.n_head:
+            k_attn = k_cat.repeat_interleave(self.group_size, dim=1)
+            v_attn = v_cat.repeat_interleave(self.group_size, dim=1)
+        else:
+            k_attn = k_cat
+            v_attn = v_cat
+
+        t_q = q.size(2)
+        t_k = k_attn.size(2)
+
+        past_len = t_k - t_q
+
+        att = (q @ k_attn.transpose(-2, -1)) * (1.0 / math.sqrt(k_attn.size(-1)))
+        
+        k_idx = torch.arange(t_k, device=x.device).view(1, t_k)
+        q_limit = past_len + torch.arange(t_q, device=x.device).view(t_q, 1)
+        causal = k_idx <= q_limit
+
+
+        att = att.masked_fill(~causal.view(1,1, t_q, t_k), float("-inf"))
+        # att = att.masked_fill(self.mask[:, :, :seqlen, :seqlen] == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
-        y = att @ v
+        y = att @ v_attn
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.n_head * self.head_dim)
-        return self.o_proj(y)
+        
+        out = self.o_proj(y)
+        present_kv = (k_cat, v_cat) if use_cache else None
+        
+        return out, present_kv
 
 
 class MLP(nn.Module):
@@ -132,10 +181,16 @@ class Block(nn.Module):
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size)
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.self_attn(self.input_layernorm(x))
+    def forward(self, x: torch.Tensor,
+                past_key_values: Optional[KVCache] = None,
+                use_cache: bool = False,
+                position_offset: int = 0,
+                ) -> tuple[torch.Tensor, Optional[KVCache]]:
+    
+        attn_out, present_kv =self.self_attn(self.input_layernorm(x), past_key_values=past_key_values, use_cache=use_cache, position_offset=position_offset)
+        x = x + attn_out
         x = x + self.mlp(self.post_attention_layernorm(x))
-        return x
+        return x, present_kv
 
 
 class Qwen(nn.Module):
@@ -152,22 +207,48 @@ class Qwen(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.model.embed_tokens.weight = self.lm_head.weight
 
-    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None):
+    def forward(self, idx: torch.Tensor, 
+                targets: Optional[torch.Tensor] = None,
+                past_key_values: Optional[PastKeyValues] = None,
+                use_cache: bool = False,
+                position_offset: Optional[int] = None,):
+
         bsz, seqlen = idx.size()
         if seqlen > self.config.max_position_embeddings:
             raise ValueError(
                 f"Sequence length {seqlen} exceeds max_position_embeddings {self.config.max_position_embeddings}"
             )
 
+        if past_key_values is None:
+            past_key_values = [None] * self.config.n_layer
+        elif len(past_key_values) != self.config.n_layer:
+            raise ValueError(
+                f"past_key_values length {len(past_key_values)} != n_layer {self.config.n_layer}"
+            )
+        
         x = self.model.embed_tokens(idx)
-        for block in self.model["layers"]:
-            x = block(x)
+        present_key_values: PastKeyValues = []
+
+        past_len = 0
+        if past_key_values is not None and len(past_key_values) > 0 and past_key_values[0] is not None:
+            past_len = int(past_key_values[0][0].size(2))
+
+        past_len = min(past_len, self.config.max_position_embeddings - 1)
+        
+        for i, block in enumerate(self.model["layers"]):
+            x, present_kv = block(x, past_key_values=past_key_values[i], use_cache=use_cache, position_offset=past_len)
+            if use_cache:
+                present_key_values.append(present_kv)
         x = self.model["norm"](x)
         logits = self.lm_head(x)
 
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        
+        if use_cache:
+            return logits, loss, present_key_values
+        
         return logits, loss
 
     @classmethod

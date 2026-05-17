@@ -70,7 +70,18 @@ def load_checkpoint(
     except TypeError:
         # Older PyTorch versions do not support weights_only yet.
         checkpoint = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model_state = checkpoint["model_state_dict"]
+    model_keys = list(model.state_dict().keys())
+    ckpt_keys = list(model_state.keys())
+    model_has_orig = any(k.startswith("_orig_mod.") for k in model_keys)
+    ckpt_has_orig = any(k.startswith("_orig_mod.") for k in ckpt_keys)
+
+    if ckpt_has_orig and not model_has_orig:
+        model_state = {k.replace("_orig_mod.", "", 1): v for k, v in model_state.items()}
+    elif model_has_orig and not ckpt_has_orig:
+        model_state = {f"_orig_mod.{k}": v for k, v in model_state.items()}
+
+    model.load_state_dict(model_state)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     # resume from next step
     return int(checkpoint["step"]) + 1
@@ -85,6 +96,7 @@ def generate_text(
     temperature: float,
     device: str,
     seed: int,
+    use_kv_cache: bool = False,
 ) -> str:
     model.eval()
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -96,24 +108,122 @@ def generate_text(
     # Keep only the last max_ctx tokens if prompt is longer than context window.
     x = torch.tensor([prompt_ids[-max_ctx:]], dtype=torch.long, device=device)
 
-    for _ in range(max_new_tokens):
+    t_gen_start = time.perf_counter()
+    per_token_times: list[float] = []
+    ttft_ms: float | None = None
+
+
+    # sync and reset CUDA peak memory so measurement is only this generation.
+    if device == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+
+    if not use_kv_cache:
+        for step in range(max_new_tokens):
+            if device == "cuda":
+                torch.cuda.synchronize()
+            t_step0 = time.perf_counter()
+            
+            with torch.no_grad():
+                # Rolling context window for autoregressive decoding.
+                x_cond = x[:, -max_ctx:]
+                logits, _ = model(x_cond)
+                next_logits = logits[:, -1, :]
+
+                if temperature <= 0:
+                    next_token = torch.argmax(next_logits, dim=-1, keepdim=True)
+                else:
+                    scaled = next_logits / temperature
+                    probs = torch.softmax(scaled, dim=-1)
+                    k = min(top_k, probs.size(-1))
+                    topk_probs, topk_idx = torch.topk(probs, k, dim=-1)
+                    sampled = torch.multinomial(topk_probs, 1, generator=generator)
+                    next_token = torch.gather(topk_idx, -1, sampled)
+
+                x = torch.cat((x, next_token), dim=1)
+
+            if device == "cuda":
+                torch.cuda.synchronize()
+            dt = time.perf_counter() - t_step0
+            per_token_times.append(dt)
+
+            if step == 0:
+                ttft_ms = (time.perf_counter() - t_gen_start) * 1000.0
+
+        decode_tokens = len(per_token_times)
+        decode_time = sum(per_token_times)
+        decode_tok = decode_tokens / max(decode_time, 1e-9)
+
+        peak_mem_mib = -1.0
+        if device == "cuda":
+            peak_mem_mib = torch.cuda.max_memory_allocated() / (1024 ** 2)
+
+        mode = "kv_cache_on" if use_kv_cache else "kv_cache_off"
+
+        print(
+            f"\nGeneration Metrics ({mode})\n"
+            f"  TTFT               : {ttft_ms:8.2f} ms\n"
+            f"  Decode Tokens      : {decode_tokens:8d} tokens\n"
+            f"  Decode Time        : {decode_time:8.4f} s\n"
+            f"  Decode Throughput  : {decode_tok:8.2f} tokens/s\n"
+            f"  Peak GPU Memory    : {peak_mem_mib:8.2f} MiB\n"
+        )
+        return dm.decode(x[0].tolist())
+    
+    # prefill KV cache with prompt
+    with torch.no_grad():
+        logits, _, past_key_values = model(x, use_cache=True)
+    
+    for step in range(max_new_tokens):
+        if device == "cuda":
+            torch.cuda.synchronize()
+        t_step0 = time.perf_counter()
+        
+        next_logits = logits[:, -1, :]
+
+        if temperature <= 0:
+            next_token = torch.argmax(next_logits, dim=-1, keepdim=True)
+        else:
+            scaled = next_logits / temperature
+            probs = torch.softmax(scaled, dim=-1)
+            k = min(top_k, probs.size(-1))
+            topk_probs, topk_idx = torch.topk(probs, k, dim=-1)
+            sampled = torch.multinomial(topk_probs, 1, generator=generator)
+            next_token = torch.gather(topk_idx, -1, sampled)
+        
+        x = torch.cat((x, next_token), dim=1)
+
         with torch.no_grad():
-            # Rolling context window for autoregressive decoding.
-            x_cond = x[:, -max_ctx:]
-            logits, _ = model(x_cond)
-            next_logits = logits[:, -1, :]
+            logits, _, past_key_values = model(next_token, past_key_values=past_key_values, use_cache=True)
 
-            if temperature <= 0:
-                next_token = torch.argmax(next_logits, dim=-1, keepdim=True)
-            else:
-                scaled = next_logits / temperature
-                probs = torch.softmax(scaled, dim=-1)
-                k = min(top_k, probs.size(-1))
-                topk_probs, topk_idx = torch.topk(probs, k, dim=-1)
-                sampled = torch.multinomial(topk_probs, 1, generator=generator)
-                next_token = torch.gather(topk_idx, -1, sampled)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        dt = time.perf_counter() - t_step0
+        per_token_times.append(dt)
 
-            x = torch.cat((x, next_token), dim=1)
+        if step == 0:
+            ttft_ms = (time.perf_counter() - t_gen_start) * 1000.0
+
+
+    decode_tokens = len(per_token_times)
+    decode_time = sum(per_token_times)
+    decode_tok = decode_tokens / max(decode_time, 1e-9)
+
+
+    peak_mem_mib = -1.0
+    if device == "cuda":
+        peak_mem_mib = torch.cuda.max_memory_allocated() / (1024 ** 2)
+
+    mode = "kv_cache_on" if use_kv_cache else "kv_cache_off"
+    # make this print more human readable with units and aligned decimals and asthetic 
+    print(
+        f"\nGeneration Metrics ({mode})\n"
+        f"  TTFT               : {ttft_ms:8.2f} ms\n"
+        f"  Decode Tokens      : {decode_tokens:8d} tokens\n"
+        f"  Decode Time        : {decode_time:8.4f} s\n"
+        f"  Decode Throughput  : {decode_tok:8.2f} tokens/s\n"
+        f"  Peak GPU Memory    : {peak_mem_mib:8.2f} MiB\n"
+    )
 
     return dm.decode(x[0].tolist())
 
@@ -310,6 +420,7 @@ def train(args: argparse.Namespace) -> None:
         temperature=args.gen_temperature,
         device=device,
         seed=args.seed,
+        use_kv_cache=args.use_kv_cache,
     )
     print("\n=== Generated Text ===")
     print(generated)
@@ -346,6 +457,7 @@ if __name__ == "__main__":
     parser.add_argument("--gen-max-new-tokens", type=int, default=80)
     parser.add_argument("--gen-top-k", type=int, default=50)
     parser.add_argument("--gen-temperature", type=float, default=1.0)
+    parser.add_argument("--use-kv-cache", action="store_true", help="Use KV cache for faster autoregressive decoding during generation")
 
     parser.add_argument("--n-head", type=int, default=4)
     parser.add_argument("--n-layer", type=int, default=8)
