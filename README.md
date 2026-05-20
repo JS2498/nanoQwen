@@ -175,3 +175,10 @@ python -m nanoqwen.compare_hf \
 - On low-VRAM GPUs, reduce `--block-size` first, then `--batch-size`.
 - `torch.compile` can improve throughput significantly on this setup.
 - Built this project inspired from Karapathy's nanoGPT and nanoChat for my own understanding of the concepts and as a hands-on implementation to study Qwen architecture and LLM training workflows from scratch. Used codex-5.3 for assistance and as instructor to learn concepts, and implementation and debugging
+
+
+## To Do
+- Separate evaluation pipeline
+- Add CLI options for Karapathy's nanoGPT code in misc folder
+- Write a blog explaining my understanding of the concepts realted to Qwen architecture
+- Training and SFT for longer steps and add the plots
