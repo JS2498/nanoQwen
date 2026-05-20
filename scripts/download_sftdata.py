@@ -7,6 +7,40 @@ from typing import Iterator
 from datasets import load_dataset, load_dataset_builder
 
 
+def _normalize_role(role: str) -> str:
+    r = str(role).strip().lower()
+    if r in {"human", "user"}:
+        return "Human"
+    if r in {"assistant", "bot", "model", "gpt"}:
+        return "Assistant"
+    if r == "system":
+        return "System"
+    return "Human"
+
+
+def _messages_to_prompt_response(messages: list[dict], min_turns: int) -> tuple[str, str] | None:
+    cleaned: list[tuple[str, str]] = []
+    for m in messages:
+        role = _normalize_role(m.get("role", ""))
+        content = str(m.get("content", "")).strip()
+        if not content:
+            continue
+        cleaned.append((role, content))
+
+    if len(cleaned) < min_turns:
+        return None
+    if cleaned[-1][0] != "Assistant":
+        return None
+
+    response = cleaned[-1][1]
+    prompt_turns = cleaned[:-1]
+    if not prompt_turns:
+        return None
+
+    prompt = "\n\n".join(f"{role}: {content}" for role, content in prompt_turns) + "\n\nAssistant:"
+    return prompt, response
+
+
 def _iter_rows(ds, prompt_field: str, response_field: str) -> Iterator[dict]:
     for row in ds:
         prompt = row.get(prompt_field)
@@ -17,6 +51,18 @@ def _iter_rows(ds, prompt_field: str, response_field: str) -> Iterator[dict]:
         response = str(response).strip()
         if not prompt or not response:
             continue
+        yield {"prompt": prompt, "response": response}
+
+
+def _iter_chat_rows(ds, messages_field: str, min_turns: int) -> Iterator[dict]:
+    for row in ds:
+        messages = row.get(messages_field)
+        if not isinstance(messages, list):
+            continue
+        converted = _messages_to_prompt_response(messages, min_turns=min_turns)
+        if converted is None:
+            continue
+        prompt, response = converted
         yield {"prompt": prompt, "response": response}
 
 
@@ -85,6 +131,9 @@ def main() -> None:
     )
     parser.add_argument("--prompt-field", type=str, default="prompt")
     parser.add_argument("--response-field", type=str, default="response")
+    parser.add_argument("--format", type=str, default="prompt_response", choices=["prompt_response", "chat_messages"])
+    parser.add_argument("--messages-field", type=str, default="messages")
+    parser.add_argument("--min-turns", type=int, default=2)
     parser.add_argument("--out", type=str, required=True, help="Output JSONL path")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--local-val-ratio", type=float, default=0.05)
@@ -99,7 +148,10 @@ def main() -> None:
             raise ValueError("local-val-ratio must be between 0 and 1")
 
         ds = load_dataset(args.dataset, args.name, split="train")
-        all_examples = list(_iter_rows(ds, args.prompt_field, args.response_field))
+        if args.format == "chat_messages":
+            all_examples = list(_iter_chat_rows(ds, args.messages_field, args.min_turns))
+        else:
+            all_examples = list(_iter_rows(ds, args.prompt_field, args.response_field))
         if len(all_examples) < 2:
             raise ValueError("Not enough examples to create local train/val split")
 
@@ -128,6 +180,9 @@ def main() -> None:
                 "local_val_ratio": args.local_val_ratio,
                 "split_seed": args.split_seed,
                 "source_total_examples": len(all_examples),
+                "format": args.format,
+                "messages_field": args.messages_field,
+                "min_turns": args.min_turns,
             }
             meta_path = out_path.with_suffix(out_path.suffix + ".meta.json")
             meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -139,7 +194,11 @@ def main() -> None:
     for split_name in splits:
         ds = load_dataset(args.dataset, args.name, split=split_name)
         out_path = _output_for_split(base_out, split_name, multi=len(splits) > 1)
-        count = _write_jsonl(_iter_rows(ds, args.prompt_field, args.response_field), out_path, args.max_samples)
+        if args.format == "chat_messages":
+            rows = _iter_chat_rows(ds, args.messages_field, args.min_turns)
+        else:
+            rows = _iter_rows(ds, args.prompt_field, args.response_field)
+        count = _write_jsonl(rows, out_path, args.max_samples)
 
         meta = {
             "dataset": args.dataset,
@@ -152,6 +211,9 @@ def main() -> None:
             "written_samples": count,
             "output": str(out_path),
             "available_splits": sorted(available),
+            "format": args.format,
+            "messages_field": args.messages_field,
+            "min_turns": args.min_turns,
         }
         meta_path = out_path.with_suffix(out_path.suffix + ".meta.json")
         meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")

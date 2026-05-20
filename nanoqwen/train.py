@@ -15,6 +15,29 @@ def count_parameters(model: torch.nn.Module) -> tuple[int, int]:
     return total, trainable
 
 
+def compute_token_budget(
+    train_tokens: int,
+    val_tokens: int,
+    batch_size: int,
+    block_size: int,
+    max_steps: int,
+) -> dict[str, float]:
+    tokens_per_step = int(batch_size * block_size)
+    planned_train_tokens = int(tokens_per_step * max_steps)
+    dataset_total_tokens = int(train_tokens + val_tokens)
+    train_coverage = (planned_train_tokens / max(train_tokens, 1)) * 100.0
+    train_epochs_equivalent = planned_train_tokens / max(train_tokens, 1)
+    return {
+        "train_tokens": float(train_tokens),
+        "val_tokens": float(val_tokens),
+        "dataset_total_tokens": float(dataset_total_tokens),
+        "tokens_per_step": float(tokens_per_step),
+        "planned_train_tokens": float(planned_train_tokens),
+        "train_coverage_percent": train_coverage,
+        "train_epochs_equivalent": train_epochs_equivalent,
+    }
+
+
 def build_lr(
     step: int,
     max_steps: int,
@@ -281,6 +304,25 @@ def train(args: argparse.Namespace) -> None:
         rebuild_token_cache=args.rebuild_token_cache,
     )
 
+    budget = compute_token_budget(
+        train_tokens=len(dm.train_data),
+        val_tokens=len(dm.val_data),
+        batch_size=args.batch_size,
+        block_size=args.block_size,
+        max_steps=args.max_steps,
+    )
+
+    print(
+        "\nToken Budget\n"
+        f"  Dataset Total      : {budget['dataset_total_tokens']/1e6:8.2f} M tokens\n"
+        f"  Train Split        : {budget['train_tokens']/1e6:8.2f} M tokens\n"
+        f"  Val Split          : {budget['val_tokens']/1e6:8.2f} M tokens\n"
+        f"  Tokens / Step      : {int(budget['tokens_per_step']):8d} tokens\n"
+        f"  Planned Train      : {budget['planned_train_tokens']/1e6:8.2f} M tokens\n"
+        f"  Train Coverage     : {budget['train_coverage_percent']:8.3f} %\n"
+        f"  Epochs Equivalent  : {budget['train_epochs_equivalent']:8.6f} x\n"
+    )
+
     config = QwenConfig(
         max_position_embeddings=args.block_size,
         vocab_size=dm.vocab_size,
@@ -374,6 +416,7 @@ def train(args: argparse.Namespace) -> None:
                     "train/loss": loss.item(),
                     "train/lr": lr,
                     "train/tokens_per_sec": tok_per_sec,
+                    "train/tokens_seen": global_step * args.batch_size * args.block_size,
                 },
                 step=global_step,
             )
@@ -411,6 +454,10 @@ def train(args: argparse.Namespace) -> None:
             if wandb_run is not None:
                 wandb_run.log({"checkpoint/step": step + 1}, step=global_step)
 
+    if device == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        
     generated = generate_text(
         model=model,
         dm=dm,
