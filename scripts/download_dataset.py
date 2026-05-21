@@ -1,4 +1,5 @@
 import argparse
+from html import parser
 import json
 from pathlib import Path
 
@@ -76,15 +77,30 @@ def main() -> None:
     parser.add_argument("--out", type=str, required=True, help="Output text file path")
     parser.add_argument("--max-samples", type=int, default=None)  # 20000 worked fine for my GPU during training
     parser.add_argument("--name", type=str, default=None, help="Optional config name/subset")
+    parser.add_argument("--streaming", action="store_true", help="Stream dataset without downloading full shards to local cache")
+    parser.add_argument("--seed", type=int, default=42)
+
     args = parser.parse_args()
 
     available_splits = infer_splits(args.dataset, args.name)
     splits_to_export = resolve_requested_splits(args.split, available_splits)
     base_out = Path(args.out)
 
+
+    if not args.streaming:
+        print(
+            "Warning: streaming is disabled. Large datasets (e.g., FineWeb sample-10BT) "
+            "may download many parquet shards before writing output."
+        )
+
     summary: list[dict] = []
     for split_name in splits_to_export:
-        ds = load_dataset(args.dataset, args.name, split=split_name)
+        # ds = load_dataset(args.dataset, args.name, split=split_name)
+        ds = load_dataset(args.dataset, args.name, split=split_name, streaming=args.streaming,)
+        
+        # for shuffling
+        if args.streaming:
+            ds = ds.shuffle(seed=args.seed, buffer_size=10000)
         out_path = output_for_split(base_out, split_name, multi=len(splits_to_export) > 1)
         count = write_text_lines(ds, args.text_field, out_path, args.max_samples)
 
