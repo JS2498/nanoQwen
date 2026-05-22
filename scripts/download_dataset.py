@@ -99,8 +99,9 @@ def main() -> None:
         ds = load_dataset(args.dataset, args.name, split=split_name, streaming=args.streaming,)
         
         # for shuffling
-        if args.streaming:
-            ds = ds.shuffle(seed=args.seed, buffer_size=10000)
+        print(f"Shuffling dataset with seed {args.seed}... commented for now")
+        # if args.streaming:
+            # ds = ds.shuffle(seed=args.seed, buffer_size=10000)
         out_path = output_for_split(base_out, split_name, multi=len(splits_to_export) > 1)
         count = write_text_lines(ds, args.text_field, out_path, args.max_samples)
 
