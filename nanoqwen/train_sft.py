@@ -190,6 +190,9 @@ def train_sft(args: argparse.Namespace) -> None:
     if args.save_interval <= 0:
         raise ValueError("save_interval must be > 0")
 
+    if args.grad_accum_steps <= 0:
+        raise ValueError("grad_accum_steps must be > 0")
+
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
@@ -284,27 +287,49 @@ def train_sft(args: argparse.Namespace) -> None:
         for g in optimizer.param_groups:
             g["lr"] = lr
 
-        xb, yb = dm.get_batch("train", args.batch_size, args.block_size, device=device)
 
         optimizer.zero_grad(set_to_none=True)
-        if device == "cuda" and args.use_amp:
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
+        loss_list = []
+
+        for _ in range(args.grad_accum_steps):
+            xb, yb = dm.get_batch("train", args.minibatch_size, args.block_size, device=device)
+
+            if device == "cuda" and args.use_amp:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    _, loss = model(xb, yb)
+                    loss = loss/args.grad_accum_steps  # scaling by 1/steps so that the average loss is used for gradient
+                    loss.backward()
+            else:
                 _, loss = model(xb, yb)
-        else:
-            _, loss = model(xb, yb)
-        loss.backward()
+                loss = loss/args.grad_accum_steps
+                loss.backward()
+
+            loss_list.append(float(loss.item()))
+
         optimizer.step()
+        train_loss = sum(loss_list)
+
+        # xb, yb = dm.get_batch("train", args.minibatch_size, args.block_size, device=device)
+
+        # optimizer.zero_grad(set_to_none=True)
+        # if device == "cuda" and args.use_amp:
+        #     with torch.autocast(device_type="cuda", dtype=torch.float16):
+        #         _, loss = model(xb, yb)
+        # else:
+        #     _, loss = model(xb, yb)
+        # loss.backward()
+        # optimizer.step()
 
         dt = time.perf_counter() - t0
         dt_ms = dt * 1000
-        tokens = args.batch_size * args.block_size
+        tokens = args.minibatch_size * args.grad_accum_steps * args.block_size
         tok_per_sec = tokens / max(dt, 1e-9)
 
         if (step % args.log_interval == 0) or (step == args.max_steps - 1):
             val_loss = estimate_val_loss_sft(
                 model=model,
                 dm=dm,
-                batch_size=args.batch_size,
+                batch_size=args.minibatch_size,
                 block_size=args.block_size,
                 eval_iters=args.eval_iters,
                 device=device,
@@ -313,7 +338,7 @@ def train_sft(args: argparse.Namespace) -> None:
             step_str = f"{step:0{step_digits}d}/{args.max_steps:0{step_digits}d}"
             print(
                 f"step: {step_str:<{(step_digits * 2) + 1}} | "
-                f"train_loss: {loss.item():>9.6f} | "
+                f"train_loss: {train_loss:>9.6f} | "
                 f"val_loss: {val_loss:>9.6f} | "
                 f"lr: {lr:>8.2e} | "
                 f"time: {dt_ms:>6.2f}ms | "
@@ -325,7 +350,7 @@ def train_sft(args: argparse.Namespace) -> None:
                 wandb.log(
                     {
                         "step": step,
-                        "train_loss": loss.item(),
+                        "train_loss": train_loss,
                         "val_loss": val_loss,
                         "lr": lr,
                         "step_time_ms": dt_ms,
@@ -360,7 +385,9 @@ if __name__ == "__main__":
 
     parser.add_argument("--pretrained-ckpt", type=str, default=None)
 
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--minibatch-size", type=int, default=2)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
+    # parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--log-interval", type=int, default=20)

@@ -141,17 +141,40 @@ class CausalSelfAttention(nn.Module):
 
         past_len = t_k - t_q
 
-        att = (q @ k_attn.transpose(-2, -1)) * (1.0 / math.sqrt(k_attn.size(-1)))
+        # not required for SPDA
+        # att = (q @ k_attn.transpose(-2, -1)) * (1.0 / math.sqrt(k_attn.size(-1)))
         
         k_idx = torch.arange(t_k, device=x.device).view(1, t_k)
         q_limit = past_len + torch.arange(t_q, device=x.device).view(t_q, 1)
         causal = k_idx <= q_limit
 
+        #============== SDPA with masking ==============
+        # didn't see improvement in the tokens throughput in my GPU. Might be my GPU issue
+        # use-amp: 540 tokens/s with or without SDPA
+        # no use-amp: 2050 tokens/s with or without SDPA
+        # SDPA expects additive mask: 0 for allowed, -inf for blocked
 
+        # attn_bias = torch.zeros((t_q, t_k), device=x.device, dtype=q.dtype)
+        # attn_bias = attn_bias.masked_fill(~causal, float("-inf"))
+        # attn_bias = attn_bias.view(1, 1, t_q, t_k)
+
+        # y = F.scaled_dot_product_attention(
+        #     q,                      # [B, H, Tq, D]
+        #     k_attn,                 # [B, H, Tk, D]
+        #     v_attn,                 # [B, H, Tk, D]
+        #     attn_mask=attn_bias,    # additive mask
+        #     dropout_p=0.0,          # set >0 only if you add training dropout intentionally
+        #     is_causal=False,        # mask already encodes cache-aware causality
+        # )
+        # print("q", q.shape, "k_attn", k_attn.shape, "v_attn", v_attn.shape, "y_pre", y.shape)
+        # print("y_for_o_proj", y.shape, "expected_last_dim", self.n_head * self.head_dim)
+        #=============================================================================
         att = att.masked_fill(~causal.view(1,1, t_q, t_k), float("-inf"))
         # att = att.masked_fill(self.mask[:, :, :seqlen, :seqlen] == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
         y = att @ v_attn
+        #===============================================================================
+        
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.n_head * self.head_dim)
         
         out = self.o_proj(y)

@@ -307,7 +307,7 @@ def train(args: argparse.Namespace) -> None:
     budget = compute_token_budget(
         train_tokens=len(dm.train_data),
         val_tokens=len(dm.val_data),
-        batch_size=args.batch_size,
+        batch_size=args.minibatch_size * args.grad_accum_steps,
         block_size=args.block_size,
         max_steps=args.max_steps,
     )
@@ -317,6 +317,7 @@ def train(args: argparse.Namespace) -> None:
         f"  Dataset Total      : {budget['dataset_total_tokens']/1e6:8.2f} M tokens\n"
         f"  Train Split        : {budget['train_tokens']/1e6:8.2f} M tokens\n"
         f"  Val Split          : {budget['val_tokens']/1e6:8.2f} M tokens\n"
+        f"  Effective Batch    : {args.minibatch_size * args.grad_accum_steps:8d}\n"
         f"  Tokens / Step      : {int(budget['tokens_per_step']):8d} tokens\n"
         f"  Planned Train      : {budget['planned_train_tokens']/1e6:8.2f} M tokens\n"
         f"  Train Coverage     : {budget['train_coverage_percent']:8.3f} %\n"
@@ -376,6 +377,8 @@ def train(args: argparse.Namespace) -> None:
         start_step = load_checkpoint(resume_path, model, optimizer, device)
         print(f"resumed_from: {resume_path} | start_step: {start_step}")
 
+
+
     for step in range(start_step, args.max_steps):
         t0 = time.perf_counter()
 
@@ -390,21 +393,43 @@ def train(args: argparse.Namespace) -> None:
         for g in optimizer.param_groups:
             g["lr"] = lr
 
-        xb, yb = dm.get_batch("train", args.batch_size, args.block_size, device=device)
-
         optimizer.zero_grad(set_to_none=True)
+        loss_list = []
 
-        if device == "cuda" and args.use_amp:
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
+        for _ in range(args.grad_accum_steps):
+            xb, yb = dm.get_batch("train", args.minibatch_size, args.block_size, device=device)
+
+            if device == "cuda" and args.use_amp:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    _, loss = model(xb, yb)
+                    loss = loss/args.grad_accum_steps  # scaling by 1/steps so that the average loss is used for gradient
+                    loss.backward()
+            else:
                 _, loss = model(xb, yb)
-        else:
-            _, loss = model(xb, yb)
-        loss.backward()
+                loss = loss/args.grad_accum_steps
+                loss.backward()
+
+            loss_list.append(float(loss.item()))
+
         optimizer.step()
+        train_loss = sum(loss_list)
+
+        # without gradient accumulation
+        # xb, yb = dm.get_batch("train", args.batch_size, args.block_size, device=device)
+
+        # optimizer.zero_grad(set_to_none=True)
+
+        # if device == "cuda" and args.use_amp:
+        #     with torch.autocast(device_type="cuda", dtype=torch.float16):
+        #         _, loss = model(xb, yb)
+        # else:
+        #     _, loss = model(xb, yb)
+        # loss.backward()
+        # optimizer.step()
 
         dt = (time.perf_counter() - t0)
         dt_ms = dt * 1000
-        tokens = args.batch_size * args.block_size
+        tokens = args.minibatch_size * args.grad_accum_steps * args.block_size
         tok_per_sec = tokens / max(dt, 1e-9)
         global_step = step + 1
 
@@ -413,10 +438,10 @@ def train(args: argparse.Namespace) -> None:
                 {
                     "step": step,
                     "global_step": global_step,
-                    "train/loss": loss.item(),
+                    "train/loss": train_loss,
                     "train/lr": lr,
                     "train/tokens_per_sec": tok_per_sec,
-                    "train/tokens_seen": global_step * args.batch_size * args.block_size,
+                    "train/tokens_seen": global_step * args.minibatch_size * args.grad_accum_steps * args.block_size,
                 },
                 step=global_step,
             )
@@ -426,7 +451,7 @@ def train(args: argparse.Namespace) -> None:
             val_loss, val_ppl = estimate_val_loss(
                 model=model,
                 dm=dm,
-                batch_size=args.batch_size,
+                batch_size=args.minibatch_size * args.grad_accum_steps,
                 block_size=args.block_size,
                 eval_iters=args.eval_iters,
                 device=device,
@@ -434,7 +459,7 @@ def train(args: argparse.Namespace) -> None:
             )
             print(
                 f"step: {step_str:<{(step_digits * 2) + 1}} | "
-                f"train_loss: {loss.item():>9.6f} | "
+                f"train_loss: {train_loss:>9.6f} | "
                 f"val_loss: {val_loss:>9.6f} | "
                 f"lr: {lr:>8.2e} | "
                 f"time: {dt_ms:>6.2f}ms | "
@@ -488,7 +513,8 @@ if __name__ == "__main__":
     parser.add_argument("--train-split", type=float, default=0.9) 
     parser.add_argument("--seed", type=int, default=1337)
 
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--minibatch-size", type=int, default=2)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--block-size", type=int, default=240)
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--log-interval", type=int, default=20)
@@ -498,6 +524,7 @@ if __name__ == "__main__":
     parser.add_argument("--resume-from", type=str, default=None)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--warmup-steps", type=int, default=20)
+
     parser.add_argument("--lr-scheduler", type=str, default="cosine", choices=["constant", "cosine"])
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--gen-prompt", type=str, default="Hello from nanoQwen")
