@@ -57,7 +57,7 @@ uv pip install wandb
 python scripts/download_dataset.py \
   --dataset HuggingFaceFW/fineweb-edu \
   --name sample-10BT \
-  --split both \
+  --split train \
   --text-field text \
   --max-samples 2000000 \
   --out data/fineweb_edu.txt
@@ -88,7 +88,8 @@ python -m nanoqwen.train \
   --val-file-name fineweb_edu_val.txt \
   --device cuda \
   --max-steps 20000 \
-  --batch-size 2 \
+  --minibatch-size 1 \
+  --grad-accum-steps 2 \
   --block-size 384 \
   --n-layer 10 \
   --n-head 8 \
@@ -118,7 +119,7 @@ python -m nanoqwen.train_sft \
   --sft-val-file ultrachat_200k_val.jsonl \
   --pretrained-ckpt checkpoints/train_step_020000.pt \
   --device cuda \
-  --batch-size 2 \
+  --minibatch-size 2 \
   --block-size 384 \
   --max-steps 6000 \
   --learning-rate 1e-4 \
@@ -172,7 +173,8 @@ python -m nanoqwen.compare_hf \
 
 ## Notes
 - Use `--resume-from` with either pretrain or SFT checkpoints to continue training.
-- On low-VRAM GPUs, reduce `--block-size` first, then `--batch-size`.
+- Effective batch size = `minibatch_size * grad_accum_steps`.
+- On low-VRAM GPUs, reduce `--block-size` first, then `--minibatch-size`, and increase `--grad-accum-steps` as needed.
 - `torch.compile` can improve throughput significantly on this setup.
 - Built this project inspired from Karapathy's nanoGPT and nanoChat for my own understanding of the concepts and as a hands-on implementation to study Qwen architecture and LLM training workflows from scratch. Used codex-5.3 for assistance and as instructor to learn concepts, and implementation and debugging
 

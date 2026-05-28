@@ -142,7 +142,7 @@ class CausalSelfAttention(nn.Module):
         past_len = t_k - t_q
 
         # not required for SPDA
-        # att = (q @ k_attn.transpose(-2, -1)) * (1.0 / math.sqrt(k_attn.size(-1)))
+        att = (q @ k_attn.transpose(-2, -1)) * (1.0 / math.sqrt(k_attn.size(-1)))
         
         k_idx = torch.arange(t_k, device=x.device).view(1, t_k)
         q_limit = past_len + torch.arange(t_q, device=x.device).view(t_q, 1)
