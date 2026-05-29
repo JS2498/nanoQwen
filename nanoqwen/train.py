@@ -8,6 +8,24 @@ import torch
 from nanoqwen.data import HFTokenDataModule
 from nanoqwen.qwen3 import Qwen, QwenConfig
 
+import os
+import contextlib
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+def setup_distributed():
+    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    
+    if not distributed:
+        return False, 0, 0, 1 # not distributed, rank, local_rank, world_size
+    
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    torch.cuda.set_device(local_rank)
+    return True, rank, local_rank, world_size
+
 
 def count_parameters(model: torch.nn.Module) -> tuple[int, int]:
     total = sum(p.numel() for p in model.parameters())
@@ -93,11 +111,22 @@ def load_checkpoint(
     except TypeError:
         # Older PyTorch versions do not support weights_only yet.
         checkpoint = torch.load(ckpt_path, map_location=device)
+
     model_state = checkpoint["model_state_dict"]
+
     model_keys = list(model.state_dict().keys())
     ckpt_keys = list(model_state.keys())
+    
+    model_has_module = any(k.startswith("module.") for k in model_keys)
+    ckpt_has_module = any(k.startswith("module.") for k in ckpt_keys)
+
     model_has_orig = any(k.startswith("_orig_mod.") for k in model_keys)
     ckpt_has_orig = any(k.startswith("_orig_mod.") for k in ckpt_keys)
+
+    if ckpt_has_module and not model_has_module:
+        model_state = {k.replace("module.", "", 1): v for k, v in model_state.items()}
+    elif model_has_module and not ckpt_has_module:
+        model_state = {f"module.{k}": v for k, v in model_state.items()}
 
     if ckpt_has_orig and not model_has_orig:
         model_state = {k.replace("_orig_mod.", "", 1): v for k, v in model_state.items()}
@@ -284,30 +313,66 @@ def train(args: argparse.Namespace) -> None:
     if args.save_interval <= 0:
         raise ValueError("save_interval must be > 0")
 
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+
+    distributed, rank, local_rank, world_size = setup_distributed()
+    master_process = (rank == 0) if distributed else True
 
     if args.device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
         device = args.device
 
-    dm = HFTokenDataModule(
-        model_name=args.model_name,
-        data_dir=args.data_dir,
-        file_name=args.train_file_name,
-        val_file_name=args.val_file_name,
-        train_split=args.train_split,
-        seed=args.seed,
-        token_cache_dir=args.token_cache_dir,
-        rebuild_token_cache=args.rebuild_token_cache,
-    )
+    seed = args.seed + rank  # ensure different seed for each process in distributed training
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+    if distributed:
+        if master_process:
+            dm = HFTokenDataModule(
+                model_name=args.model_name,
+                data_dir=args.data_dir,
+                file_name=args.train_file_name,
+                val_file_name=args.val_file_name,
+                train_split=args.train_split,
+                seed=seed,
+                token_cache_dir=args.token_cache_dir,
+                rebuild_token_cache=args.rebuild_token_cache,
+            )
+        dist.barrier()
+        
+        if not master_process:
+            dm = HFTokenDataModule(
+                model_name=args.model_name,
+                data_dir=args.data_dir,
+                file_name=args.train_file_name,
+                val_file_name=args.val_file_name,
+                train_split=args.train_split,
+                seed=seed,
+                token_cache_dir=args.token_cache_dir,
+                rebuild_token_cache=False,
+            )
+        dist.barrier()
+
+    else:
+        dm = HFTokenDataModule(
+            model_name=args.model_name,
+            data_dir=args.data_dir,
+            file_name=args.train_file_name,
+            val_file_name=args.val_file_name,
+            train_split=args.train_split,
+            seed=seed,
+            token_cache_dir=args.token_cache_dir,
+            rebuild_token_cache=args.rebuild_token_cache,
+        )
+
 
     budget = compute_token_budget(
         train_tokens=len(dm.train_data),
         val_tokens=len(dm.val_data),
-        batch_size=args.minibatch_size * args.grad_accum_steps,
+        batch_size=args.minibatch_size * args.grad_accum_steps * world_size,
         block_size=args.block_size,
         max_steps=args.max_steps,
     )
@@ -317,7 +382,7 @@ def train(args: argparse.Namespace) -> None:
         f"  Dataset Total      : {budget['dataset_total_tokens']/1e6:8.2f} M tokens\n"
         f"  Train Split        : {budget['train_tokens']/1e6:8.2f} M tokens\n"
         f"  Val Split          : {budget['val_tokens']/1e6:8.2f} M tokens\n"
-        f"  Effective Batch    : {args.minibatch_size * args.grad_accum_steps:8d}\n"
+        f"  Effective Batch    : {args.minibatch_size * args.grad_accum_steps * world_size:8d}\n"
         f"  Tokens / Step      : {int(budget['tokens_per_step']):8d} tokens\n"
         f"  Planned Train      : {budget['planned_train_tokens']/1e6:8.2f} M tokens\n"
         f"  Train Coverage     : {budget['train_coverage_percent']:8.3f} %\n"
@@ -336,13 +401,7 @@ def train(args: argparse.Namespace) -> None:
     model = Qwen(config).to(device)
     if args.use_compile:
         model = torch.compile(model)
-    model.train()
-    total_params, trainable_params = count_parameters(model)
-    print(
-        "model_params: "
-        f"total={total_params:,} ({total_params/1e6:.2f}M) | "
-        f"trainable={trainable_params:,} ({trainable_params/1e6:.2f}M)"
-    )
+
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -351,8 +410,33 @@ def train(args: argparse.Namespace) -> None:
         eps=1e-8,
         foreach=False,
     )
+
+    step_digits = len(str(args.max_steps))
+    start_step = 0
+
+    if args.resume_from is not None:
+        resume_path = Path(args.resume_from)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
+        start_step = load_checkpoint(resume_path, model, optimizer, device)
+        print(f"resumed_from: {resume_path} | start_step: {start_step}")
+
+    if distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+
+    raw_model = model.module if distributed else model
+    
+    model.train()
+    if master_process:
+        total_params, trainable_params = count_parameters(raw_model)
+        print(
+            "model_params: "
+            f"total={total_params:,} ({total_params/1e6:.2f}M) | "
+            f"trainable={trainable_params:,} ({trainable_params/1e6:.2f}M)"
+        )
+
     wandb_run = None
-    if args.use_wandb:
+    if args.use_wandb and master_process:
         try:
             import wandb  # type: ignore
 
@@ -366,18 +450,6 @@ def train(args: argparse.Namespace) -> None:
         except Exception as e:
             print(f"wandb disabled: {e}")
             wandb_run = None
-
-    step_digits = len(str(args.max_steps))
-    start_step = 0
-
-    if args.resume_from is not None:
-        resume_path = Path(args.resume_from)
-        if not resume_path.exists():
-            raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
-        start_step = load_checkpoint(resume_path, model, optimizer, device)
-        print(f"resumed_from: {resume_path} | start_step: {start_step}")
-
-
 
     for step in range(start_step, args.max_steps):
         t0 = time.perf_counter()
@@ -394,25 +466,32 @@ def train(args: argparse.Namespace) -> None:
             g["lr"] = lr
 
         optimizer.zero_grad(set_to_none=True)
-        loss_list = []
+        train_loss = torch.zeros((), device=device)
 
-        for _ in range(args.grad_accum_steps):
-            xb, yb = dm.get_batch("train", args.minibatch_size, args.block_size, device=device)
+        for micro_step in range(args.grad_accum_steps):
+            # xb, yb = dm.get_batch("train", args.minibatch_size, args.block_size, device=device)
+            xb, yb = dm.get_batch("train", args.minibatch_size, args.block_size, device=device, rank=rank, world_size=world_size)
 
             if device == "cuda" and args.use_amp:
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
                     _, loss = model(xb, yb)
-                    loss = loss/args.grad_accum_steps  # scaling by 1/steps so that the average loss is used for gradient
-                    loss.backward()
             else:
                 _, loss = model(xb, yb)
-                loss = loss/args.grad_accum_steps
-                loss.backward()
 
-            loss_list.append(float(loss.item()))
+            loss = loss/args.grad_accum_steps  # scaling by 1/steps so that the average loss is used for gradient
+            train_loss += loss.detach() 
 
+            if distributed:
+                # toggle the switch to average the gradients only for the last gradient accumulation step
+                model.require_backward_grad_sync = (micro_step == args.grad_accum_steps - 1)
+
+            loss.backward() # all_reduce is applied only on the last micro_step when require_backward_grad_sync is True
+
+        
+        if distributed:
+            dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
         optimizer.step()
-        train_loss = sum(loss_list)
+
 
         # without gradient accumulation
         # xb, yb = dm.get_batch("train", args.batch_size, args.block_size, device=device)
@@ -429,76 +508,84 @@ def train(args: argparse.Namespace) -> None:
 
         dt = (time.perf_counter() - t0)
         dt_ms = dt * 1000
-        tokens = args.minibatch_size * args.grad_accum_steps * args.block_size
+        tokens = args.minibatch_size * args.grad_accum_steps * args.block_size * world_size
         tok_per_sec = tokens / max(dt, 1e-9)
         global_step = step + 1
 
-        if wandb_run is not None:
-            wandb_run.log(
-                {
-                    "step": step,
-                    "global_step": global_step,
-                    "train/loss": train_loss,
-                    "train/lr": lr,
-                    "train/tokens_per_sec": tok_per_sec,
-                    "train/tokens_seen": global_step * args.minibatch_size * args.grad_accum_steps * args.block_size,
-                },
-                step=global_step,
-            )
+        if master_process:
 
-        step_str = f"{step:0{step_digits}d}/{args.max_steps:0{step_digits}d}"
-        if (step % args.log_interval == 0) or (step == args.max_steps - 1):
-            val_loss, val_ppl = estimate_val_loss(
-                model=model,
-                dm=dm,
-                batch_size=args.minibatch_size * args.grad_accum_steps,
-                block_size=args.block_size,
-                eval_iters=args.eval_iters,
-                device=device,
-                use_amp=args.use_amp,
-            )
-            print(
-                f"step: {step_str:<{(step_digits * 2) + 1}} | "
-                f"train_loss: {train_loss:>9.6f} | "
-                f"val_loss: {val_loss:>9.6f} | "
-                f"lr: {lr:>8.2e} | "
-                f"time: {dt_ms:>6.2f}ms | "
-                f"tokens_per_sec: {tok_per_sec:>9.2f}"
-            )
+            
             if wandb_run is not None:
                 wandb_run.log(
                     {
-                        "val/loss": val_loss,
-                        "val/perplexity": val_ppl,
+                        "step": step,
+                        "global_step": global_step,
+                        "train/loss": train_loss.item(),
+                        "train/lr": lr,
+                        "train/tokens_per_sec": tok_per_sec,
+                        "train/tokens_seen": global_step * args.minibatch_size * args.grad_accum_steps * args.block_size * world_size,
                     },
                     step=global_step,
                 )
-        if ((step + 1) % args.save_interval == 0) or (step == args.max_steps - 1):
-            ckpt_file = Path(args.checkpoint_dir) / f"train_step_{step+1:06d}.pt"
-            save_checkpoint(ckpt_file, model, optimizer, step, args)
-            if wandb_run is not None:
-                wandb_run.log({"checkpoint/step": step + 1}, step=global_step)
+
+            step_str = f"{step:0{step_digits}d}/{args.max_steps:0{step_digits}d}"
+            if (step % args.log_interval == 0) or (step == args.max_steps - 1):
+                val_loss, val_ppl = estimate_val_loss(
+                    model=raw_model,
+                    dm=dm,
+                    batch_size=args.minibatch_size * args.grad_accum_steps,
+                    block_size=args.block_size,
+                    eval_iters=args.eval_iters,
+                    device=device,
+                    use_amp=args.use_amp,
+                )
+                print(
+                    f"step: {step_str:<{(step_digits * 2) + 1}} | "
+                    f"train_loss: {train_loss.item():>9.6f} | "
+                    f"val_loss: {val_loss:>9.6f} | "
+                    f"lr: {lr:>8.2e} | "
+                    f"time: {dt_ms:>6.2f}ms | "
+                    f"tokens_per_sec: {tok_per_sec:>9.2f}"
+                )
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {
+                            "val/loss": val_loss,
+                            "val/perplexity": val_ppl,
+                        },
+                        step=global_step,
+                    )
+            if ((step + 1) % args.save_interval == 0) or (step == args.max_steps - 1):
+                ckpt_file = Path(args.checkpoint_dir) / f"train_step_{step+1:06d}.pt"
+                save_checkpoint(ckpt_file, raw_model, optimizer, step, args)
+                if wandb_run is not None:
+                    wandb_run.log({"checkpoint/step": step + 1}, step=global_step)
+
 
     if device == "cuda":
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
-        
-    generated = generate_text(
-        model=model,
-        dm=dm,
-        prompt=args.gen_prompt,
-        max_new_tokens=args.gen_max_new_tokens,
-        top_k=args.gen_top_k,
-        temperature=args.gen_temperature,
-        device=device,
-        seed=args.seed,
-        use_kv_cache=args.use_kv_cache,
-    )
-    print("\n=== Generated Text ===")
-    print(generated)
-    if wandb_run is not None:
-        wandb_run.log({"generation/text": generated}, step=args.max_steps)
-        wandb_run.finish()
+
+    if master_process:
+        generated = generate_text(
+            model=raw_model,
+            dm=dm,
+            prompt=args.gen_prompt,
+            max_new_tokens=args.gen_max_new_tokens,
+            top_k=args.gen_top_k,
+            temperature=args.gen_temperature,
+            device=device,
+            seed=args.seed,
+            use_kv_cache=args.use_kv_cache,
+        )
+        print("\n=== Generated Text ===")
+        print(generated)
+        if wandb_run is not None:
+            wandb_run.log({"generation/text": generated}, step=args.max_steps)
+            wandb_run.finish()
+    
+    if distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

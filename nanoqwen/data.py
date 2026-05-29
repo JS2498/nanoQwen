@@ -136,6 +136,8 @@ class HFTokenDataModule:
         batch_size: int,
         block_size: int,
         device: str | torch.device = "cpu",
+        rank: int = 0,
+        world_size: int = 1,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if split not in {"train", "val"}:
             raise ValueError("split must be one of {'train', 'val'}")
@@ -145,12 +147,18 @@ class HFTokenDataModule:
         if n <= block_size:
             raise ValueError(f"block_size={block_size} is too large for {split} split of length {n}")
 
-        starts = torch.randint(
-            low=0,
-            high=n - block_size,
-            size=(batch_size,),
-            generator=self._rng,
-        ).tolist()
+        # Calculate the starting positions for each sequence in the batch
+        
+        max_start = n - block_size
+        num_slots = (max_start - rank + world_size - 1) // world_size
+        choice = torch.randint(0, num_slots, (batch_size,), generator=self._rng)
+        starts = (rank + choice * world_size).tolist()
+        # starts = torch.randint(
+        #     low=0,
+        #     high=n - block_size,
+        #     size=(batch_size,),
+        #     generator=self._rng,
+        # ).tolist()
 
         x_np = np.empty((batch_size, block_size), dtype=np.int64)
         y_np = np.empty((batch_size, block_size), dtype=np.int64)
