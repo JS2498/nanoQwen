@@ -368,27 +368,6 @@ def train(args: argparse.Namespace) -> None:
             rebuild_token_cache=args.rebuild_token_cache,
         )
 
-
-    budget = compute_token_budget(
-        train_tokens=len(dm.train_data),
-        val_tokens=len(dm.val_data),
-        batch_size=args.minibatch_size * args.grad_accum_steps * world_size,
-        block_size=args.block_size,
-        max_steps=args.max_steps,
-    )
-
-    print(
-        "\nToken Budget\n"
-        f"  Dataset Total      : {budget['dataset_total_tokens']/1e6:8.2f} M tokens\n"
-        f"  Train Split        : {budget['train_tokens']/1e6:8.2f} M tokens\n"
-        f"  Val Split          : {budget['val_tokens']/1e6:8.2f} M tokens\n"
-        f"  Effective Batch    : {args.minibatch_size * args.grad_accum_steps * world_size:8d}\n"
-        f"  Tokens / Step      : {int(budget['tokens_per_step']):8d} tokens\n"
-        f"  Planned Train      : {budget['planned_train_tokens']/1e6:8.2f} M tokens\n"
-        f"  Train Coverage     : {budget['train_coverage_percent']:8.3f} %\n"
-        f"  Epochs Equivalent  : {budget['train_epochs_equivalent']:8.6f} x\n"
-    )
-
     config = QwenConfig(
         max_position_embeddings=args.block_size,
         vocab_size=dm.vocab_size,
@@ -427,7 +406,29 @@ def train(args: argparse.Namespace) -> None:
     raw_model = model.module if distributed else model
     
     model.train()
+    
     if master_process:
+
+        budget = compute_token_budget(
+        train_tokens=len(dm.train_data),
+        val_tokens=len(dm.val_data),
+        batch_size=args.minibatch_size * args.grad_accum_steps * world_size,
+        block_size=args.block_size,
+        max_steps=args.max_steps,
+        )
+
+        print(
+            "\nToken Budget\n"
+            f"  Dataset Total      : {budget['dataset_total_tokens']/1e6:8.2f} M tokens\n"
+            f"  Train Split        : {budget['train_tokens']/1e6:8.2f} M tokens\n"
+            f"  Val Split          : {budget['val_tokens']/1e6:8.2f} M tokens\n"
+            f"  Effective Batch    : {args.minibatch_size * args.grad_accum_steps * world_size:8d}\n"
+            f"  Tokens / Step      : {int(budget['tokens_per_step']):8d} tokens\n"
+            f"  Planned Train      : {budget['planned_train_tokens']/1e6:8.2f} M tokens\n"
+            f"  Train Coverage     : {budget['train_coverage_percent']:8.3f} %\n"
+            f"  Epochs Equivalent  : {budget['train_epochs_equivalent']:8.6f} x\n"
+        )
+
         total_params, trainable_params = count_parameters(raw_model)
         print(
             "model_params: "
